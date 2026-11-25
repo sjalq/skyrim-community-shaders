@@ -2005,9 +2005,12 @@ void PerformanceOverlay::UpdateGraphValues()
 			state.postFGFrameTimeMs = fgDeltaTime * 1000.0f;
 			state.postFGFps = 1000.0f / state.postFGFrameTimeMs;
 		} else {
-			// Fallback if FG time is not available
-			state.postFGFrameTimeMs = state.frameTimeMs / Settings::kFrameGenerationMultiplier;
-			state.postFGFps = state.fps * Settings::kFrameGenerationMultiplier;
+			// Fallback if FG time is not available. DLSS multi-frame generation shows 3 or 4 frames
+			// per rendered frame, so use the live multiplier instead of the fixed FSR factor.
+			const uint32_t liveMultiplier = globals::features::upscaling.GetFrameGenerationMultiplier();
+			const float frameGenerationMultiplier = liveMultiplier > 1 ? static_cast<float>(liveMultiplier) : Settings::kFrameGenerationMultiplier;
+			state.postFGFrameTimeMs = state.frameTimeMs / frameGenerationMultiplier;
+			state.postFGFps = state.fps * frameGenerationMultiplier;
 		}
 
 		// Update post-FG smooth values when timer elapses
