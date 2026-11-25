@@ -74,7 +74,15 @@ public:
 		bool reflexUseMarkersToOptimize = false;
 		bool reflexUseFPSLimit = false;
 		float reflexFPSLimit = 60.0f;
+		// NVIDIA DLSS Frame Generation (DX12 Streamline). Generated frames per rendered frame:
+		// 1 = 2x, 2 = 3x, 3 = 4x (multi-frame generation, RTX 50 series). Clamped at runtime to
+		// what slDLSSGGetState reports as supported (numFramesToGenerateMax).
+		uint dlssgFramesToGenerate = 3;
+		// Use DLSS-G instead of FSR frame generation when the GPU supports it (takes effect at restart).
+		bool frameGenerationPreferDLSSG = true;
 	};
+
+	static constexpr uint kDLSSGMaxFramesToGenerate = 3;  ///< 4x is the highest multiplier DLSS-G offers
 
 	Settings settings;
 
@@ -131,6 +139,12 @@ public:
 	UpscaleMethod GetUpscaleMethod() const;
 	FrameGenMethod GetFrameGenMethod() const;
 	bool UsesDLSSGFrameGen() const;
+
+	/**
+	 * @brief Number of displayed frames per rendered frame while frame generation runs.
+	 * @return 1 without frame generation, 2 for FSR, numFramesToGenerate + 1 for DLSS-G.
+	 */
+	uint32_t GetFrameGenerationMultiplier() const;
 
 	void CheckResources(UpscaleMethod a_upscalemethod);
 	void CreateUpscalingTextureResources(UpscaleMethod a_upscalemethod);
@@ -230,7 +244,7 @@ public:
 	void SetProxyD3D11Device(ID3D11Device* device);
 	void SetProxyD3D11DeviceContext(ID3D11DeviceContext* context);
 	void CreateProxySwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
-	void CreateProxySwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
+	bool CreateProxySwapChainDLSSG(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
 	void CreateProxyInterop();
 	IDXGISwapChain* GetProxySwapChain();
 

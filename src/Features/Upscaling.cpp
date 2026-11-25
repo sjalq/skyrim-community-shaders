@@ -38,7 +38,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexLowLatencyBoost,
 	reflexUseMarkersToOptimize,
 	reflexUseFPSLimit,
-	reflexFPSLimit);
+	reflexFPSLimit,
+	dlssgFramesToGenerate,
+	frameGenerationPreferDLSSG);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
@@ -112,14 +114,20 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 	if (shouldProxy) {
 		logger::info("[Frame Generation] Frame Generation enabled, using D3D12 proxy");
 
-		// Check DX12 Streamline features early to determine FG method before swap chain creation
+		// Decide the frame-generation backend before any swap chain exists: DLSS-G (DX12 Streamline
+		// instance) when the GPU/driver support it and the user has not opted out, FSR otherwise.
 		bool dlssgAvailable = false;
 		if (upscaling.streamlineDX12.initialized) {
 			upscaling.streamlineDX12.CheckFeatures(pAdapter);
 			dlssgAvailable = upscaling.streamlineDX12.featureDLSSG;
+			if (dlssgAvailable && !upscaling.settings.frameGenerationPreferDLSSG) {
+				logger::info("[Frame Generation] DLSS-G is available but disabled in settings; using FSR frame generation");
+				dlssgAvailable = false;
+			}
 		}
+		const bool fsrAvailable = upscaling.fidelityFX.featureFSR3FG;
 
-		if (dlssgAvailable || upscaling.HasFrameGenModule()) {
+		if (dlssgAvailable || fsrAvailable) {
 			DX::ThrowIfFailed(D3D11CreateDevice(
 				pAdapter,
 				DriverType,
@@ -135,47 +143,49 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 			upscaling.SetProxyD3D11Device(*ppDevice);
 			upscaling.SetProxyD3D11DeviceContext(*ppImmediateContext);
 
+			bool swapChainCreated = false;
 			if (dlssgAvailable) {
-				logger::info("[Frame Generation] DLSS-G available, creating direct swap chain");
-				upscaling.CreateProxySwapChainDirect(pAdapter, *pSwapChainDesc);
-			} else {
+				logger::info("[Frame Generation] DLSS-G available, creating the swap chain through Streamline");
+				swapChainCreated = upscaling.CreateProxySwapChainDLSSG(pAdapter, *pSwapChainDesc);
+			}
+			if (!swapChainCreated && fsrAvailable) {
+				logger::info("[Frame Generation] Using AMD FSR frame generation");
 				upscaling.CreateProxySwapChain(pAdapter, *pSwapChainDesc);
+				swapChainCreated = true;
 			}
 
-			upscaling.CreateProxyInterop();
+			if (swapChainCreated) {
+				upscaling.CreateProxyInterop();
 
-			*ppSwapChain = upscaling.GetProxySwapChain();
+				*ppSwapChain = upscaling.GetProxySwapChain();
 
-			upscaling.d3d12SwapChainActive = true;
+				upscaling.d3d12SwapChainActive = true;
 
-			if (upscaling.IsBackendInitialized()) {
-				upscaling.UpgradeBackendInterface((void**)&(*ppDevice));
-				upscaling.SetBackendD3DDevice(*ppDevice);
-				// Feature availability (notably Reflex/PCL) is only reliable after device bind.
-				upscaling.CheckBackendFeatures(pAdapter);
-				upscaling.PostBackendDevice();
-			}
-
-			// Bind the DX12 Streamline instance
-			if (upscaling.streamlineDX12.initialized) {
-				// Upgrade D3D12 interfaces with Streamline
-				ID3D12Device* upgradedDevice = upscaling.dx12SwapChain.d3d12Device.get();
-				if (upscaling.streamlineDX12.slUpgradeInterface) {
-					upscaling.streamlineDX12.slUpgradeInterface((void**)&upgradedDevice);
-
-					ID3D12CommandQueue* cq = upscaling.dx12SwapChain.commandQueue.get();
-					upscaling.streamlineDX12.slUpgradeInterface((void**)&cq);
-
-					if (dlssgAvailable) {
-						upscaling.streamlineDX12.slUpgradeInterface((void**)&upscaling.dx12SwapChain.swapChain);
-					}
+				if (upscaling.IsBackendInitialized()) {
+					upscaling.UpgradeBackendInterface((void**)&(*ppDevice));
+					upscaling.SetBackendD3DDevice(*ppDevice);
+					// Feature availability (notably Reflex/PCL) is only reliable after device bind.
+					upscaling.CheckBackendFeatures(pAdapter);
+					upscaling.PostBackendDevice();
 				}
 
-				upscaling.streamlineDX12.SetD3DDevice12(upgradedDevice);
-				upscaling.streamlineDX12.PostDevice();
+				return S_OK;
 			}
 
-			return S_OK;
+			// DLSS-G failed and there is no FSR fallback: undo the proxy device and continue with
+			// the regular D3D11 swap chain below.
+			logger::warn("[Frame Generation] DLSS-G swap chain creation failed and FSR frame generation is unavailable, skipping proxy");
+			upscaling.dx12SwapChain.d3d11Context = nullptr;
+			upscaling.dx12SwapChain.d3d11Device = nullptr;
+			if (*ppImmediateContext) {
+				(*ppImmediateContext)->Release();
+				*ppImmediateContext = nullptr;
+			}
+			if (*ppDevice) {
+				(*ppDevice)->Release();
+				*ppDevice = nullptr;
+			}
+			upscaling.fidelityFXMissing = true;
 		} else {
 			logger::warn("[Frame Generation] No frame generation module available, skipping proxy");
 			upscaling.fidelityFXMissing = true;
@@ -404,6 +414,38 @@ void Upscaling::DrawSettings()
 			ImGui::TextUnformatted(T(TKEY("frame_generation_in_menus_tooltip_2"), "May feel smoother, but increases menu input latency."));
 		}
 
+		if (streamlineDX12.featureDLSSG || UsesDLSSGFrameGen()) {
+			ImGui::Separator();
+
+			ImGui::Checkbox(T(TKEY("dlssg_prefer"), "Use NVIDIA DLSS Frame Generation"), &settings.frameGenerationPreferDLSSG);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(T(TKEY("dlssg_prefer_tooltip_1"), "Uses DLSS Frame Generation instead of AMD FSR Frame Generation when the GPU supports it."));
+				ImGui::TextUnformatted(T(TKEY("dlssg_prefer_tooltip_2"), "Changing this requires a restart."));
+			}
+			if (frameGenerationDx12PathActive && settings.frameGenerationPreferDLSSG != UsesDLSSGFrameGen())
+				Util::Text::Warning("Warning: Requires restart");
+
+			const char* multiplierLabels[] = { "2x", "3x", "4x" };
+			int multiplierIndex = static_cast<int>(std::clamp(settings.dlssgFramesToGenerate, 1u, kDLSSGMaxFramesToGenerate)) - 1;
+			if (ImGui::Combo(T(TKEY("dlssg_multiplier"), "DLSS Frame Generation Multiplier"), &multiplierIndex, multiplierLabels, IM_ARRAYSIZE(multiplierLabels)))
+				settings.dlssgFramesToGenerate = static_cast<uint>(multiplierIndex) + 1;
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(T(TKEY("dlssg_multiplier_tooltip_1"), "Displayed frames per rendered frame. 3x and 4x (multi frame generation) need an RTX 50 series GPU."));
+				ImGui::TextUnformatted(T(TKEY("dlssg_multiplier_tooltip_2"), "Values above what the GPU supports fall back to the highest supported multiplier. Applies immediately."));
+			}
+
+			if (UsesDLSSGFrameGen()) {
+				if (streamlineDX12.dlssgFramesToGenerateMax > 0)
+					ImGui::Text("%s %ux", T(TKEY("dlssg_supported_up_to"), "GPU supports up to"), streamlineDX12.dlssgFramesToGenerateMax + 1);
+				if (streamlineDX12.dlssgFramesToGenerateActive > 0)
+					ImGui::Text("%s %ux", T(TKEY("dlssg_running_at"), "Running at"), streamlineDX12.dlssgFramesToGenerateActive + 1);
+				if (streamlineDX12.dlssgStatus != sl::DLSSGStatus::eOk)
+					Util::Text::Warning("DLSS Frame Generation reported a problem (status 0x%x), see CommunityShaders.log", static_cast<uint32_t>(streamlineDX12.dlssgStatus));
+				if (!dx12SwapChain.CanSeparateUIForDLSSG())
+					ImGui::TextDisabled("%s", T(TKEY("dlssg_no_ui_separation"), "UI separation unavailable: the HUD is interpolated with the scene."));
+			}
+		}
+
 		ImGui::TreePop();
 	}
 
@@ -558,6 +600,11 @@ void Upscaling::LoadSettings(json& o_json)
 			clampedReflexFPSLimit);
 	}
 	settings.reflexFPSLimit = clampedReflexFPSLimit;
+	if (settings.dlssgFramesToGenerate < 1 || settings.dlssgFramesToGenerate > kDLSSGMaxFramesToGenerate) {
+		const uint clampedFrames = std::clamp(settings.dlssgFramesToGenerate, 1u, kDLSSGMaxFramesToGenerate);
+		logger::warn("[Upscaling] Loaded dlssgFramesToGenerate {} out of range, clamping to {}", settings.dlssgFramesToGenerate, clampedFrames);
+		settings.dlssgFramesToGenerate = clampedFrames;
+	}
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
 	if (iniSettingCollection) {
 		auto setting = iniSettingCollection->GetSetting("bUseTAA:Display");
@@ -1051,8 +1098,10 @@ void Upscaling::SetupResources()
 
 	rcas.Initialize();
 
-	if (d3d12SwapChainActive)
+	if (d3d12SwapChainActive) {
 		dx12SwapChain.CreateSharedResources();
+		dx12SwapChain.SetupDLSSGUIComposition();
+	}
 
 	copyDepthToSharedBufferPS.attach((ID3D11PixelShader*)Util::CompileShader(L"Data\\Shaders\\Upscaling\\CopyDepthToSharedBufferPS.hlsl", { { "PSHADER", "" } }, "ps_5_0"));
 }
@@ -1176,16 +1225,21 @@ void Upscaling::TimerSleepQPC(int64_t targetQPC)
 void Upscaling::FrameLimiter()
 {
 	if (d3d12SwapChainActive) {
-		// Use frame latency waitable object if available for better frame pacing
+		// Use frame latency waitable object if available for better frame pacing. The DLSS-G swap
+		// chain has none (DLSS-G paces its own presents), so skip the wait when the handle is null.
 		HANDLE waitableObject = GetFrameLatencyWaitableObject();
 
 		// Wait for the next frame presentation slot
-		WaitForSingleObject(waitableObject, INFINITE);
+		if (waitableObject)
+			WaitForSingleObject(waitableObject, INFINITE);
 
 		if (settings.frameLimitMode) {
 			static constexpr int64_t kNanosecondsPerSecond = 1000000000LL;
-			static constexpr double kFrameGenerationRateScale = 0.5;
-			const double frameRateScale = ShouldUseFrameGenerationThisFrame() ? kFrameGenerationRateScale : 1.0;
+			// Cap rendered frames at refresh / multiplier so displayed frames land on the refresh
+			// rate (2x for FSR, up to 4x for DLSS multi-frame generation).
+			const double frameRateScale = ShouldUseFrameGenerationThisFrame() ?
+			                                  1.0 / static_cast<double>(std::max(GetFrameGenerationMultiplier(), 2u)) :
+			                                  1.0;
 			int64_t targetFrameTimeNS = int64_t(static_cast<double>(kNanosecondsPerSecond) / (refreshRate * frameRateScale));
 			int64_t targetFrameTicks = (targetFrameTimeNS * qpf.QuadPart) / kNanosecondsPerSecond;
 
@@ -1271,7 +1325,7 @@ bool Upscaling::IsFrameGenerationActive() const
 	if (!IsFrameGenerationDx12PathActive() || !settings.frameGenerationMode)
 		return false;
 	if (dx12SwapChain.useDLSSG)
-		return streamlineDX12.featureDLSSG;
+		return streamlineDX12.featureDLSSG && streamlineDX12.dlssgEnabledLastFrame;
 	return fidelityFX.isFrameGenActive;
 }
 
@@ -1390,6 +1444,15 @@ bool Upscaling::UsesDLSSGFrameGen() const
 	return d3d12SwapChainActive && dx12SwapChain.useDLSSG;
 }
 
+uint32_t Upscaling::GetFrameGenerationMultiplier() const
+{
+	if (!IsFrameGenerationActive())
+		return 1;
+	if (UsesDLSSGFrameGen())
+		return std::max(streamlineDX12.dlssgFramesToGenerateActive, 1u) + 1;
+	return 2;
+}
+
 // Proxy interface methods
 void Upscaling::SetProxyD3D11Device(ID3D11Device* device)
 {
@@ -1406,9 +1469,9 @@ void Upscaling::CreateProxySwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC
 	dx12SwapChain.CreateSwapChain(adapter, swapChainDesc);
 }
 
-void Upscaling::CreateProxySwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc)
+bool Upscaling::CreateProxySwapChainDLSSG(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc)
 {
-	dx12SwapChain.CreateSwapChainDirect(adapter, swapChainDesc);
+	return dx12SwapChain.CreateSwapChainDLSSG(adapter, swapChainDesc);
 }
 
 void Upscaling::CreateProxyInterop()
@@ -1723,9 +1786,20 @@ void Upscaling::ApplySharpening()
 
 void Upscaling::Main_UpdateJitter::thunk(RE::BSGraphics::State* a_state)
 {
-	globals::features::upscaling.ConfigureTAA();
+	auto& upscaling = globals::features::upscaling;
+
+	// Render submission for this frame starts here (once per frame, before the world renders).
+	// DLSS-G's Reflex/PCL needs these markers with the same frame index as the Reflex sleep and
+	// the present (see DX12SwapChain::Present).
+	if (upscaling.UsesDLSSGFrameGen() && globals::state) {
+		const uint32_t frameIndex = globals::state->frameCount;
+		upscaling.streamlineDX12.SetPCLMarker(sl::PCLMarker::eSimulationEnd, frameIndex);
+		upscaling.streamlineDX12.SetPCLMarker(sl::PCLMarker::eRenderSubmitStart, frameIndex);
+	}
+
+	upscaling.ConfigureTAA();
 	func(a_state);
-	globals::features::upscaling.ConfigureUpscaling(a_state);
+	upscaling.ConfigureUpscaling(a_state);
 }
 
 void Upscaling::MenuManagerDrawInterfaceStartHook::thunk(int64_t a1)

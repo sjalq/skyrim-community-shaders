@@ -99,12 +99,42 @@ public:
 	// Whether DLSS-G is handling frame generation (vs FSR FG)
 	bool useDLSSG = false;
 
+	// DLSS-G only: the Streamline proxy of the presenting queue. The swap chain is created through
+	// it so DLSS-G's queue/swap-chain hooks run; CS itself submits through the native commandQueue.
+	winrt::com_ptr<ID3D12CommandQueue> commandQueueSL;
+
+	// DLSS-G only: copy of the scene before the UI is composited on top (kBufferTypeHUDLessColor).
+	WrappedResource* hudlessBufferWrapped = nullptr;
+
+	// DLSS-G only: D3D11 compute pass that composites the premultiplied UI buffer onto the scene.
+	winrt::com_ptr<ID3D11ComputeShader> composeUICS;
+	bool composeUICSFailed = false;
+
+	// Set by HDRDisplay::SetUIBuffer when this frame's UI went to uiBufferWrapped because frame
+	// generation composites it; consumed (and cleared) by Present.
+	bool uiRoutedForFGComposite = false;
+
 	// Returns the current frame time (in seconds) for accurate FPS calculation when frame generation is active
 	float GetFrameTime() const;
 
 	void CreateD3D12Device(IDXGIAdapter* a_adapter);
 	void CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
-	void CreateSwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
+
+	/**
+	 * @brief Creates the D3D12 device, queue and swap chain for DLSS-G through Streamline's manual-hooking proxies.
+	 *
+	 * Order follows the Streamline manual-hooking guide: native device -> slSetD3DDevice (initializes
+	 * the plugins and registers DLSS-G's hooks) -> command queue via the proxy device -> swap chain via
+	 * the proxy factory. On failure all partially created objects are dropped so the FSR path can start clean.
+	 * @return True if the DLSS-G swap chain is ready.
+	 */
+	bool CreateSwapChainDLSSG(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
+
+	/** @brief True when DLSS-G can receive the UI separately (compose shader and HUD-less buffer ready). */
+	bool CanSeparateUIForDLSSG() const;
+
+	/** @brief Compiles the DLSS-G UI composition shader (no-op if already compiled or previously failed). */
+	void SetupDLSSGUIComposition();
 
 	void CreateInterop();
 	void RecreateWrappedResources(const DXGI_SWAP_CHAIN_DESC1& desc);
@@ -136,4 +166,11 @@ public:
 
 	// D3D12 interop resource management
 	void CreateSharedResources();
+
+private:
+	/**
+	 * @brief DLSS-G: keeps a HUD-less copy of the scene and composites the UI onto the backbuffer on D3D11.
+	 * @return True if the backbuffer now contains scene + UI and the HUD-less copy is valid.
+	 */
+	bool ComposeUIForDLSSG();
 };

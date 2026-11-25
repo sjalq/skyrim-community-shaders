@@ -811,8 +811,13 @@ void HDRDisplay::RestoreFramebuffer()
 
 bool HDRDisplay::IsFGCompositingThisFrame() const
 {
+	// FSR FG composites the UI buffer itself. DLSS-G does not, but DX12SwapChain composites the
+	// UI buffer on D3D11 before present (keeping a HUD-less copy for DLSS-G), so the UI stays in
+	// its own buffer for DLSS-G too, as long as that composition pass is available.
 	auto& upscaling = globals::features::upscaling;
-	return upscaling.ShouldUseFrameGenerationThisFrame() && !upscaling.UsesDLSSGFrameGen();
+	if (!upscaling.ShouldUseFrameGenerationThisFrame())
+		return false;
+	return !upscaling.UsesDLSSGFrameGen() || upscaling.dx12SwapChain.CanSeparateUIForDLSSG();
 }
 
 HDRDisplay::D3D12UIBufferMode HDRDisplay::GetD3D12UIBufferMode()
@@ -846,6 +851,7 @@ void HDRDisplay::SetUIBuffer()
 	// fallback copy carries it to the wrapped back buffer.
 	if (globals::features::upscaling.d3d12SwapChainActive) {
 		auto& upscaling = globals::features::upscaling;
+		upscaling.dx12SwapChain.uiRoutedForFGComposite = false;
 		if (!upscaling.dx12SwapChain.swapChainBufferWrapped || !upscaling.dx12SwapChain.swapChainBufferWrapped->rtv)
 			return;
 
@@ -853,6 +859,10 @@ void HDRDisplay::SetUIBuffer()
 
 		if (uiBufferMode.useUIBuffer && (!upscaling.dx12SwapChain.uiBufferWrapped || !upscaling.dx12SwapChain.uiBufferWrapped->rtv))
 			return;
+
+		// Tells DX12SwapChain::Present (DLSS-G) that this frame's UI is in uiBufferWrapped and
+		// was not composited by HDROutputCS, so it must composite it before presenting.
+		upscaling.dx12SwapChain.uiRoutedForFGComposite = uiBufferMode.useUIBuffer && IsFGCompositingThisFrame();
 
 		ID3D11RenderTargetView* targetRTV = uiBufferMode.useUIBuffer ?
 		                                        upscaling.dx12SwapChain.uiBufferWrapped->rtv :

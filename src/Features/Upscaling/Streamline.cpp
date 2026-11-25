@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
+#include <string>
 #include <dxgi.h>
 #include <dxgi1_3.h>
 
@@ -80,7 +82,14 @@ void Streamline::LoadInterposer()
 
 	std::filesystem::path pluginDirPath = std::filesystem::path(pluginDir);
 
-	std::wstring interposerPath = (pluginDirPath / interposerDllName).wstring();
+	// Load by absolute path: both instances use a DLL named sl.interposer.dll, and only a
+	// fully qualified path guarantees the loader maps this directory's copy instead of handing
+	// back the module the other instance already loaded.
+	std::error_code interposerPathError;
+	auto interposerDir = std::filesystem::absolute(pluginDirPath, interposerPathError);
+	if (interposerPathError)
+		interposerDir = pluginDirPath;
+	std::wstring interposerPath = (interposerDir / interposerDllName).wstring();
 	interposer = LoadLibraryW(interposerPath.c_str());
 	if (interposer == nullptr) {
 		DWORD errorCode = GetLastError();
@@ -401,14 +410,51 @@ void Streamline::PostDevice()
 
 }
 
-void Streamline::SetD3DDevice12(ID3D12Device* a_device)
+bool Streamline::SetD3DDevice12(ID3D12Device* a_device)
 {
 	if (!initialized || !slSetD3DDevice || !a_device)
-		return;
-	if (SL_FAILED(result, slSetD3DDevice(static_cast<void*>(a_device))))
+		return false;
+	if (SL_FAILED(result, slSetD3DDevice(static_cast<void*>(a_device)))) {
 		logger::error("[Streamline DX12] slSetD3DDevice(device) failed: {}", magic_enum::enum_name(result));
-	else
-		logger::info("[Streamline DX12] D3D12 device bound");
+		return false;
+	}
+	logger::info("[Streamline DX12] D3D12 device bound, plugins initialized");
+	return true;
+}
+
+sl::FrameToken* Streamline::GetFrameToken(uint32_t frameIndex)
+{
+	if (!initialized || !slGetNewFrameToken)
+		return nullptr;
+
+	sl::FrameToken* token = nullptr;
+	if (SL_FAILED(result, slGetNewFrameToken(token, &frameIndex))) {
+		static bool errorLogged = false;
+		if (!errorLogged) {
+			errorLogged = true;
+			logger::error("[Streamline {}] Could not get frame token for frame {}: {}", instanceTag, frameIndex, magic_enum::enum_name(result));
+		}
+		return nullptr;
+	}
+	return token;
+}
+
+void Streamline::SetPCLMarker(sl::PCLMarker marker, uint32_t frameIndex)
+{
+	if (!featurePCL || !slPCLSetMarker)
+		return;
+
+	auto* token = GetFrameToken(frameIndex);
+	if (!token)
+		return;
+
+	if (SL_FAILED(result, slPCLSetMarker(marker, *token))) {
+		static bool errorLogged = false;
+		if (!errorLogged) {
+			errorLogged = true;
+			logger::warn("[Streamline {}] slPCLSetMarker({}) failed: {}", instanceTag, magic_enum::enum_name(marker), magic_enum::enum_name(result));
+		}
+	}
 }
 
 /**
@@ -441,6 +487,54 @@ bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport)
 	if (!EnsureFrameToken())
 		return false;
 
+	return SetFrameConstants(*frameToken, p_viewport);
+}
+
+namespace
+{
+	/**
+	 * @brief Fills clipToCameraView/clipToPrevClip/prevClipToClip like sl::recalculateCameraMatrices,
+	 * but with caller-owned previous-frame matrices instead of function statics.
+	 */
+	void RecalculateCameraMatrices(sl::Constants& values, sl::float4x4& prevCameraViewToWorld, sl::float4x4& prevCameraViewToClip, bool& hasPrev)
+	{
+		sl::vectorNormalize(values.cameraRight);
+		sl::vectorNormalize(values.cameraFwd);
+		sl::vectorCrossProduct(values.cameraUp, values.cameraFwd, values.cameraRight);
+		sl::vectorNormalize(values.cameraUp);
+
+		sl::float4x4 cameraViewToWorld;
+		cameraViewToWorld.setRow(0, sl::float4(values.cameraRight.x, values.cameraRight.y, values.cameraRight.z, 0.f));
+		cameraViewToWorld.setRow(1, sl::float4(values.cameraUp.x, values.cameraUp.y, values.cameraUp.z, 0.f));
+		cameraViewToWorld.setRow(2, sl::float4(values.cameraFwd.x, values.cameraFwd.y, values.cameraFwd.z, 0.f));
+		cameraViewToWorld.setRow(3, sl::float4(values.cameraPos.x, values.cameraPos.y, values.cameraPos.z, 1.f));
+
+		if (!hasPrev) {
+			prevCameraViewToWorld = cameraViewToWorld;
+			prevCameraViewToClip = values.cameraViewToClip;
+			hasPrev = true;
+		}
+
+		sl::matrixFullInvert(values.clipToCameraView, values.cameraViewToClip);
+
+		sl::float4x4 cameraViewToPrevCameraView;
+		sl::calcCameraToPrevCamera(cameraViewToPrevCameraView, cameraViewToWorld, prevCameraViewToWorld);
+
+		sl::float4x4 clipToPrevCameraView;
+		sl::matrixMul(clipToPrevCameraView, values.clipToCameraView, cameraViewToPrevCameraView);
+		sl::matrixMul(values.clipToPrevClip, clipToPrevCameraView, prevCameraViewToClip);
+		sl::matrixFullInvert(values.prevClipToClip, values.clipToPrevClip);
+
+		prevCameraViewToWorld = cameraViewToWorld;
+		prevCameraViewToClip = values.cameraViewToClip;
+	}
+}
+
+bool Streamline::SetFrameConstants(const sl::FrameToken& token, sl::ViewportHandle p_viewport)
+{
+	if (!initialized || !slSetConstants)
+		return false;
+
 	sl::Constants slConstants = {};
 
 	slConstants.cameraAspectRatio = (float)globals::game::graphicsState->screenWidth / (float)globals::game::graphicsState->screenHeight;
@@ -461,7 +555,7 @@ bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport)
 	slConstants.cameraViewToClip = *(sl::float4x4*)&cameraViewToClip;
 	slConstants.depthInverted = sl::Boolean::eFalse;
 
-	recalculateCameraMatrices(slConstants);
+	RecalculateCameraMatrices(slConstants, prevCameraViewToWorld, prevCameraViewToClip, hasPrevCameraMatrices);
 
 	auto& upscaling = globals::features::upscaling;
 	auto jitter = upscaling.jitter;
@@ -475,7 +569,7 @@ bool Streamline::CheckFrameConstants(sl::ViewportHandle p_viewport)
 	slConstants.motionVectorsDilated = sl::Boolean::eFalse;
 	slConstants.motionVectorsJittered = sl::Boolean::eFalse;
 
-	if (SL_FAILED(res, slSetConstants(slConstants, *frameToken, p_viewport))) {
+	if (SL_FAILED(res, slSetConstants(slConstants, token, p_viewport))) {
 		logger::error("[Streamline {}] Could not set constants", instanceTag);
 		return false;
 	}
@@ -766,53 +860,184 @@ void Streamline::UpdateReflex()
 	if (lastReflexSleepFrame == currentFrame)
 		return;
 
-	if (!EnsureFrameToken())
+	// The DX12 (DLSS-G) instance requests tokens with explicit frame indices so that the Reflex
+	// sleep, the PCL markers, the constants and the tags of one frame share the same index
+	// (DX12SwapChain::Present presents frame frameCount - 1, because State::Reset() has already
+	// advanced the counter when the D3D12 present runs).
+	sl::FrameToken* token = nullptr;
+	if (renderAPI == sl::RenderAPI::eD3D12)
+		token = GetFrameToken(currentFrame);
+	else if (EnsureFrameToken())
+		token = frameToken;
+	if (!token)
 		return;
 
 	lastReflexSleepFrame = currentFrame;
-	if (SL_FAILED(result, slReflexSleep(*frameToken))) {
+	if (SL_FAILED(result, slReflexSleep(*token))) {
 		logger::warn("[Streamline {}] Reflex sleep call failed: {}", instanceTag, magic_enum::enum_name(result));
+	}
+
+	if (renderAPI == sl::RenderAPI::eD3D12)
+		SetPCLMarker(sl::PCLMarker::eSimulationStart, currentFrame);
+}
+
+namespace
+{
+	std::string DescribeDLSSGStatus(sl::DLSSGStatus status)
+	{
+		if (status == sl::DLSSGStatus::eOk)
+			return "OK";
+
+		std::string description;
+		const auto append = [&](sl::DLSSGStatus flag, const char* name) {
+			if ((static_cast<uint32_t>(status) & static_cast<uint32_t>(flag)) == 0)
+				return;
+			if (!description.empty())
+				description += ", ";
+			description += name;
+		};
+		append(sl::DLSSGStatus::eFailResolutionTooLow, "resolution too low");
+		append(sl::DLSSGStatus::eFailReflexNotDetectedAtRuntime, "Reflex not detected at runtime");
+		append(sl::DLSSGStatus::eFailHDRFormatNotSupported, "HDR format not supported");
+		append(sl::DLSSGStatus::eFailCommonConstantsInvalid, "common constants invalid");
+		append(sl::DLSSGStatus::eFailGetCurrentBackBufferIndexNotCalled, "GetCurrentBackBufferIndex not called");
+		if (description.empty())
+			description = std::format("unknown status 0x{:x}", static_cast<uint32_t>(status));
+		return description;
 	}
 }
 
-void Streamline::ConfigureDLSSG(bool enabled)
+void Streamline::ConfigureDLSSG(bool enabled, bool retainResources, uint32_t requestedFramesToGenerate)
 {
 	if (!initialized || !slDLSSGSetOptions)
 		return;
 
+	// numFramesToGenerate must stay within [1, numFramesToGenerateMax]; until the first state
+	// query has reported the GPU's maximum, only 2x (one generated frame) is known to be valid.
+	const uint32_t maxFramesToGenerate = std::max(dlssgFramesToGenerateMax, 1u);
+	const uint32_t framesToGenerate = std::clamp(requestedFramesToGenerate, 1u, maxFramesToGenerate);
+
 	sl::DLSSGOptions options{};
 	options.mode = enabled ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-	options.numFramesToGenerate = 1;
+	options.numFramesToGenerate = framesToGenerate;
+	if (retainResources)
+		options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
 
-	if (SL_FAILED(result, slDLSSGSetOptions(viewport, options))) {
+	sl::Result result = slDLSSGSetOptions(viewport, options);
+	if (result != sl::Result::eOk && enabled && framesToGenerate > 1) {
+		// Fall back to 2x rather than losing frame generation entirely.
+		options.numFramesToGenerate = 1;
+		const sl::Result fallbackResult = slDLSSGSetOptions(viewport, options);
+		static bool fallbackLogged = false;
+		if (!fallbackLogged) {
+			fallbackLogged = true;
+			logger::warn("[Streamline DX12] slDLSSGSetOptions with {} generated frames failed ({}); falling back to 2x: {}",
+				framesToGenerate, magic_enum::enum_name(result), magic_enum::enum_name(fallbackResult));
+		}
+		result = fallbackResult;
+	}
+
+	if (result != sl::Result::eOk) {
 		static bool errorLogged = false;
 		if (!errorLogged) {
 			errorLogged = true;
 			logger::error("[Streamline DX12] slDLSSGSetOptions failed: {}", magic_enum::enum_name(result));
 		}
+		dlssgFramesToGenerateActive = 0;
+		dlssgEnabledLastFrame = false;
+		return;
+	}
+
+	const uint32_t activeFrames = enabled ? options.numFramesToGenerate : 0;
+	if (activeFrames != dlssgFramesToGenerateActive) {
+		if (activeFrames)
+			logger::info("[Streamline DX12] DLSS-G on: {}x ({} generated frame(s) per rendered frame, GPU max {})",
+				activeFrames + 1, activeFrames, dlssgFramesToGenerateMax);
+		else
+			logger::info("[Streamline DX12] DLSS-G off{}", retainResources ? " (resources retained)" : "");
+	}
+	dlssgFramesToGenerateActive = activeFrames;
+	dlssgEnabledLastFrame = enabled;
+}
+
+void Streamline::TagDLSSGResources(const sl::FrameToken& token, ID3D12GraphicsCommandList* cmdList,
+	ID3D12Resource* depth, ID3D12Resource* mvec, const sl::Extent& renderExtent,
+	ID3D12Resource* hudLessColor, ID3D12Resource* uiColorAndAlpha, const sl::Extent& backbufferExtent)
+{
+	if (!initialized || !slSetTagForFrame || !cmdList || !depth || !mvec)
+		return;
+
+	// All shared resources are D3D11 textures opened on D3D12; they sit in COMMON outside the
+	// copies CS records itself, and SL transitions them as needed.
+	sl::Resource depthRes{ sl::ResourceType::eTex2d, depth, D3D12_RESOURCE_STATE_COMMON };
+	sl::Resource mvecRes{ sl::ResourceType::eTex2d, mvec, D3D12_RESOURCE_STATE_COMMON };
+	sl::Resource hudLessRes{ sl::ResourceType::eTex2d, hudLessColor, D3D12_RESOURCE_STATE_COMMON };
+	sl::Resource uiRes{ sl::ResourceType::eTex2d, uiColorAndAlpha, D3D12_RESOURCE_STATE_COMMON };
+
+	const bool separatedUI = hudLessColor && uiColorAndAlpha;
+
+	// Hudless/UI tags are cleared (null resource) on frames where the UI was not kept separate,
+	// so DLSS-G never pairs a stale HUD-less image with the current backbuffer.
+	sl::ResourceTag tags[] = {
+		sl::ResourceTag{ &depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &renderExtent },
+		sl::ResourceTag{ &mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &renderExtent },
+		sl::ResourceTag{ separatedUI ? &hudLessRes : nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &backbufferExtent },
+		sl::ResourceTag{ separatedUI ? &uiRes : nullptr, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, &backbufferExtent },
+	};
+
+	if (SL_FAILED(result, slSetTagForFrame(token, viewport, tags, _countof(tags), cmdList))) {
+		static bool errorLogged = false;
+		if (!errorLogged) {
+			errorLogged = true;
+			logger::error("[Streamline DX12] slSetTagForFrame failed: {}", magic_enum::enum_name(result));
+		}
 	}
 }
 
-void Streamline::TagDX12Resources(ID3D12GraphicsCommandList* cmdList,
-	ID3D12Resource* depth, ID3D12Resource* mvec, ID3D12Resource* hudLessColor,
-	uint32_t width, uint32_t height)
+void Streamline::QueryDLSSGState(ID3D12CommandQueue* presentQueue, bool waitForInputs)
 {
-	if (!initialized || !slSetTagForFrame || !frameToken || !cmdList)
+	if (!initialized || !slDLSSGGetState)
 		return;
 
-	sl::Extent extent{ 0, 0, width, height };
+	sl::DLSSGState state{};
+	if (SL_FAILED(result, slDLSSGGetState(viewport, state, nullptr))) {
+		static bool errorLogged = false;
+		if (!errorLogged) {
+			errorLogged = true;
+			logger::warn("[Streamline DX12] slDLSSGGetState failed: {}", magic_enum::enum_name(result));
+		}
+		return;
+	}
 
-	sl::Resource depthRes = { sl::ResourceType::eTex2d, depth, D3D12_RESOURCE_STATE_COMMON };
-	sl::Resource mvecRes = { sl::ResourceType::eTex2d, mvec, D3D12_RESOURCE_STATE_COMMON };
-	sl::Resource hudLessRes = { sl::ResourceType::eTex2d, hudLessColor, D3D12_RESOURCE_STATE_COMMON };
+	if (state.numFramesToGenerateMax != dlssgFramesToGenerateMax) {
+		logger::info("[Streamline DX12] DLSS-G supports up to {} generated frame(s) per rendered frame ({}x)",
+			state.numFramesToGenerateMax, state.numFramesToGenerateMax + 1);
+		dlssgFramesToGenerateMax = state.numFramesToGenerateMax;
+	}
 
-	sl::ResourceTag tags[] = {
-		{ &depthRes, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent },
-		{ &mvecRes, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent },
-		{ &hudLessRes, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent, &extent },
-	};
+	if (state.status != dlssgStatus) {
+		if (state.status == sl::DLSSGStatus::eOk)
+			logger::info("[Streamline DX12] DLSS-G status OK");
+		else
+			logger::warn("[Streamline DX12] DLSS-G status: {}", DescribeDLSSGStatus(state.status));
+		dlssgStatus = state.status;
+	}
 
-	slSetTagForFrame(*frameToken, viewport, tags, _countof(tags), cmdList);
+	dlssgFramesPresented = state.numFramesActuallyPresented;
+	dlssgVsyncSupportAvailable = state.bIsVsyncSupportAvailable == sl::Boolean::eTrue;
+
+	// The D3D11 queue waits on the presenting queue before it reuses depth/motion/HUD-less/UI,
+	// so making that queue wait for DLSS-G's input-consumption fence protects the shared inputs.
+	if (waitForInputs && presentQueue && state.inputsProcessingCompletionFence && state.lastPresentInputsProcessingCompletionFenceValue) {
+		auto* inputsFence = static_cast<ID3D12Fence*>(state.inputsProcessingCompletionFence);
+		if (FAILED(presentQueue->Wait(inputsFence, state.lastPresentInputsProcessingCompletionFenceValue))) {
+			static bool waitErrorLogged = false;
+			if (!waitErrorLogged) {
+				waitErrorLogged = true;
+				logger::warn("[Streamline DX12] Failed to wait for the DLSS-G input fence");
+			}
+		}
+	}
 }
 
 /**

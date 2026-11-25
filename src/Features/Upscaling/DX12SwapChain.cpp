@@ -2,6 +2,9 @@
 
 #include <FidelityFX/api/include/dx12/ffx_api_dx12.hpp>
 #include <dxgi1_6.h>
+#include <format>
+#include <stdexcept>
+#include <vector>
 
 #include "../HDRDisplay.h"
 #include "../Upscaling.h"
@@ -113,67 +116,227 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 	fidelityFX.SetupFrameGeneration();
 }
 
-void DX12SwapChain::CreateSwapChainDirect(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
+bool DX12SwapChain::CreateSwapChainDLSSG(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
 {
-	CreateD3D12Device(adapter);
+	auto& slDX12 = globals::features::upscaling.streamlineDX12;
 
-	IDXGIFactory4* dxgiFactory;
-	DX::ThrowIfFailed(adapter->GetParent(IID_PPV_ARGS(&dxgiFactory)));
+	const auto resetPartialState = [&]() {
+		swapChainBuffers[0] = nullptr;
+		swapChainBuffers[1] = nullptr;
+		if (swapChain) {
+			swapChain->Release();
+			swapChain = nullptr;
+		}
+		for (int i = 0; i < 2; i++) {
+			commandLists[i] = nullptr;
+			commandAllocators[i] = nullptr;
+		}
+		commandQueue = nullptr;
+		commandQueueSL = nullptr;
+		// Streamline was already bound to this device; keep it alive so the dormant DX12 SL
+		// instance never holds a dangling device pointer.
+		static winrt::com_ptr<ID3D12Device> retiredDevice;
+		if (d3d12Device)
+			retiredDevice = d3d12Device;
+		d3d12Device = nullptr;
+		useDLSSG = false;
+	};
 
-	DXGI_FORMAT attemptedFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
-	DXGI_FORMAT negotiatedFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
-	bool fallbackUsed = false;
+	try {
+		if (!slDX12.initialized || !slDX12.slUpgradeInterface || !slDX12.slGetNativeInterface)
+			throw std::runtime_error("Streamline DX12 interposer is not initialized");
 
-	D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = { DXGI_FORMAT_R10G10B10A2_UNORM, D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT2_NONE };
-	if (SUCCEEDED(d3d12Device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport, sizeof(formatSupport)))) {
-		if ((formatSupport.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) == 0) {
-			logger::warn("[DX12SwapChain] R10G10B10A2_UNORM not supported as render target, falling back to R8G8B8A8_UNORM");
+		// 1. Native device.
+		DX::ThrowIfFailed(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(d3d12Device.put())));
+
+		// 2. Bind it to Streamline. This initializes the plugins and registers DLSS-G's hooks, which
+		//    must exist before the queue and swap chain are created.
+		if (!slDX12.SetD3DDevice12(d3d12Device.get()))
+			throw std::runtime_error("slSetD3DDevice failed");
+		slDX12.PostDevice();
+		if (!slDX12.featureDLSSG)
+			throw std::runtime_error("DLSS-G entry points are unavailable after device bind");
+
+		// 3. Command queue through the proxy device (DLSS-G hooks ID3D12Device::CreateCommandQueue).
+		// The proxy (which holds its own reference to the native device) is intentionally never
+		// released: the proxy queue created below keeps pointing at it for the process lifetime.
+		ID3D12Device* proxyDevice = d3d12Device.get();
+		if (SL_FAILED(upgradeResult, slDX12.slUpgradeInterface(reinterpret_cast<void**>(&proxyDevice))))
+			throw std::runtime_error(std::format("slUpgradeInterface(ID3D12Device) failed: {}", magic_enum::enum_name(upgradeResult)));
+
+		D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+		queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+		queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+		queueDesc.NodeMask = 0;
+		DX::ThrowIfFailed(proxyDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(commandQueueSL.put())));
+
+		// CS submits its own work through the native queue (Streamline guide: native interfaces
+		// everywhere except the hooked entry points).
+		void* nativeQueue = nullptr;
+		if (SL_FAILED(nativeResult, slDX12.slGetNativeInterface(commandQueueSL.get(), &nativeQueue)) || !nativeQueue)
+			throw std::runtime_error(std::format("slGetNativeInterface(ID3D12CommandQueue) failed: {}", magic_enum::enum_name(nativeResult)));
+		commandQueue.attach(static_cast<ID3D12CommandQueue*>(nativeQueue));
+
+		for (int i = 0; i < 2; i++) {
+			DX::ThrowIfFailed(d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(commandAllocators[i].put())));
+			DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(commandLists[i].put())));
+			commandLists[i]->Close();
+		}
+
+		// 4. Swap chain through the proxy factory (DLSS-G hooks CreateSwapChainForHwnd, GetBuffer,
+		//    GetCurrentBackBufferIndex, Present and ResizeBuffers on it).
+		winrt::com_ptr<IDXGIFactory4> nativeFactory;
+		DX::ThrowIfFailed(adapter->GetParent(IID_PPV_ARGS(nativeFactory.put())));
+		IDXGIFactory* proxyFactory = nativeFactory.get();
+		if (SL_FAILED(factoryResult, slDX12.slUpgradeInterface(reinterpret_cast<void**>(&proxyFactory))))
+			throw std::runtime_error(std::format("slUpgradeInterface(IDXGIFactory) failed: {}", magic_enum::enum_name(factoryResult)));
+		winrt::com_ptr<IDXGIFactory2> proxyFactory2;
+		const HRESULT factoryQI = proxyFactory->QueryInterface(IID_PPV_ARGS(proxyFactory2.put()));
+		proxyFactory->Release();  // proxyFactory2 holds the reference that matters
+		DX::ThrowIfFailed(factoryQI);
+
+		DXGI_FORMAT attemptedFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+		DXGI_FORMAT negotiatedFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+		bool fallbackUsed = false;
+
+		D3D12_FEATURE_DATA_FORMAT_SUPPORT formatSupport = { DXGI_FORMAT_R10G10B10A2_UNORM, D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT2_NONE };
+		if (SUCCEEDED(d3d12Device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &formatSupport, sizeof(formatSupport)))) {
+			if ((formatSupport.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) == 0) {
+				logger::warn("[DX12SwapChain] R10G10B10A2_UNORM not supported as render target, falling back to R8G8B8A8_UNORM");
+				negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+				fallbackUsed = true;
+			}
+		} else {
+			logger::warn("[DX12SwapChain] CheckFeatureSupport failed for R10G10B10A2_UNORM, falling back to R8G8B8A8_UNORM");
 			negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 			fallbackUsed = true;
 		}
-	} else {
-		logger::warn("[DX12SwapChain] CheckFeatureSupport failed for R10G10B10A2_UNORM, falling back to R8G8B8A8_UNORM");
-		negotiatedFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-		fallbackUsed = true;
+
+		logger::info("[DX12SwapChain] DLSS-G swap chain format negotiation: attempted={}, negotiated={}, fallback={}",
+			static_cast<uint32_t>(attemptedFormat),
+			static_cast<uint32_t>(negotiatedFormat),
+			fallbackUsed ? "true" : "false");
+
+		swapChainDesc = {};
+		swapChainDesc.Width = a_swapChainDesc.BufferDesc.Width;
+		swapChainDesc.Height = a_swapChainDesc.BufferDesc.Height;
+		swapChainDesc.Format = negotiatedFormat;
+		swapChainDesc.SampleDesc.Count = 1;
+		swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+		swapChainDesc.BufferCount = 2;
+		swapChainDesc.SwapEffect = a_swapChainDesc.SwapEffect;
+		// No frame-latency waitable object: DLSS-G presents from its own pacing thread and Reflex
+		// handles latency; waiting on the native swap chain's object would fight that pacer.
+		swapChainDesc.Flags = a_swapChainDesc.Flags & ~static_cast<UINT>(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
+
+		winrt::com_ptr<IDXGISwapChain1> swapChain1;
+		DX::ThrowIfFailed(proxyFactory2->CreateSwapChainForHwnd(
+			commandQueueSL.get(),
+			a_swapChainDesc.OutputWindow,
+			&swapChainDesc,
+			nullptr,
+			nullptr,
+			swapChain1.put()));
+
+		DX::ThrowIfFailed(swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain)));
+
+		DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(swapChainBuffers[0].put())));
+		DX::ThrowIfFailed(swapChain->GetBuffer(1, IID_PPV_ARGS(swapChainBuffers[1].put())));
+
+		frameIndex = swapChain->GetCurrentBackBufferIndex();
+
+		auto* hdr = globals::features::hdrDisplay.loaded ? &globals::features::hdrDisplay : nullptr;
+		bool enableHDR = hdr && hdr->settings.enableHDR;
+		SetColorSpace(enableHDR && !fallbackUsed);
+
+		useDLSSG = true;
+
+		// Query the supported multi-frame range up front so the first frames already use it.
+		slDX12.QueryDLSSGState(nullptr, false);
+
+		logger::info("[DX12SwapChain] Created DLSS-G swap chain through Streamline proxies ({}x{}, format {})",
+			swapChainDesc.Width, swapChainDesc.Height, static_cast<uint32_t>(swapChainDesc.Format));
+		return true;
+	} catch (const std::exception& e) {
+		logger::error("[DX12SwapChain] DLSS-G swap chain creation failed: {}. Falling back to FSR frame generation if available.", e.what());
+		resetPartialState();
+		slDX12.featureDLSSG = false;
+		return false;
 	}
+}
 
-	logger::info("[DX12SwapChain] Direct swap chain format negotiation: attempted={}, negotiated={}, fallback={}",
-		static_cast<uint32_t>(attemptedFormat),
-		static_cast<uint32_t>(negotiatedFormat),
-		fallbackUsed ? "true" : "false");
+bool DX12SwapChain::CanSeparateUIForDLSSG() const
+{
+	return useDLSSG && composeUICS && hudlessBufferWrapped && hudlessBufferWrapped->srv &&
+	       uiBufferWrapped && uiBufferWrapped->srv && swapChainBufferWrapped && swapChainBufferWrapped->uav;
+}
 
-	swapChainDesc = {};
-	swapChainDesc.Width = a_swapChainDesc.BufferDesc.Width;
-	swapChainDesc.Height = a_swapChainDesc.BufferDesc.Height;
-	swapChainDesc.Format = negotiatedFormat;
-	swapChainDesc.SampleDesc.Count = 1;
-	swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	swapChainDesc.BufferCount = 2;
-	swapChainDesc.SwapEffect = a_swapChainDesc.SwapEffect;
-	swapChainDesc.Flags = a_swapChainDesc.Flags | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+void DX12SwapChain::SetupDLSSGUIComposition()
+{
+	if (!useDLSSG || composeUICS || composeUICSFailed)
+		return;
 
-	winrt::com_ptr<IDXGISwapChain1> swapChain1;
-	DX::ThrowIfFailed(dxgiFactory->CreateSwapChainForHwnd(
-		commandQueue.get(),
-		a_swapChainDesc.OutputWindow,
-		&swapChainDesc,
-		nullptr,
-		nullptr,
-		swapChain1.put()));
+	std::vector<std::pair<const char*, const char*>> defines;
+	composeUICS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\Upscaling\\ComposeUICS.hlsl", defines, "cs_5_0")));
+	if (composeUICS) {
+		logger::info("[DX12SwapChain] DLSS-G UI composition ready (HUD-less + UI color/alpha inputs enabled)");
+	} else {
+		composeUICSFailed = true;
+		logger::warn("[DX12SwapChain] ComposeUICS.hlsl failed to compile; DLSS-G will run without HUD-less/UI inputs");
+	}
+}
 
-	DX::ThrowIfFailed(swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain)));
+bool DX12SwapChain::ComposeUIForDLSSG()
+{
+	if (!CanSeparateUIForDLSSG())
+		return false;
 
-	DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(&swapChainBuffers[0])));
-	DX::ThrowIfFailed(swapChain->GetBuffer(1, IID_PPV_ARGS(&swapChainBuffers[1])));
+	auto context = d3d11Context.get();
+	auto state = globals::state;
 
-	frameIndex = swapChain->GetCurrentBackBufferIndex();
+	state->BeginPerfEvent("DLSS-G UI Composite");
 
-	auto* hdr = globals::features::hdrDisplay.loaded ? &globals::features::hdrDisplay : nullptr;
-	bool enableHDR = hdr && hdr->settings.enableHDR;
-	SetColorSpace(enableHDR && !fallbackUsed);
+	// The UI buffer is usually still bound as the render target here (kFRAMEBUFFER redirect), and
+	// D3D11 nulls an SRV whose resource is bound for output, so unbind OM first and restore after.
+	ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	ID3D11DepthStencilView* savedDSV = nullptr;
+	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
+	context->OMSetRenderTargets(0, nullptr, nullptr);
 
-	useDLSSG = true;
-	logger::info("[DX12SwapChain] Created direct swap chain for DLSS-G ({}x{})", swapChainDesc.Width, swapChainDesc.Height);
+	// HUD-less copy of the scene, then backbuffer = UI + (1 - UI.a) * scene (premultiplied UI,
+	// the same blend FidelityFX applies with FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA).
+	context->CopyResource(hudlessBufferWrapped->resource11, swapChainBufferWrapped->resource11);
+
+	ID3D11ShaderResourceView* views[2] = { hudlessBufferWrapped->srv, uiBufferWrapped->srv };
+	context->CSSetShaderResources(0, ARRAYSIZE(views), views);
+	ID3D11UnorderedAccessView* uavs[1] = { swapChainBufferWrapped->uav };
+	context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
+	context->CSSetShader(composeUICS.get(), nullptr, 0);
+
+	globals::profiler->BeginPass("DX12SwapChain::DLSSGUIComposite");
+	context->Dispatch((swapChainDesc.Width + 7) / 8, (swapChainDesc.Height + 7) / 8, 1);
+	globals::profiler->EndPass();
+
+	views[0] = nullptr;
+	views[1] = nullptr;
+	context->CSSetShaderResources(0, ARRAYSIZE(views), views);
+	uavs[0] = nullptr;
+	context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
+	context->CSSetShader(nullptr, nullptr, 0);
+
+	context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
+	for (auto*& rtv : savedRTVs) {
+		if (rtv) {
+			rtv->Release();
+			rtv = nullptr;
+		}
+	}
+	if (savedDSV)
+		savedDSV->Release();
+
+	state->EndPerfEvent();
+	return true;
 }
 
 void DX12SwapChain::CreateInterop()
@@ -205,18 +368,27 @@ void DX12SwapChain::RecreateWrappedResources(const DXGI_SWAP_CHAIN_DESC1& desc)
 	// allocation cannot leave the proxy with only half of its interop textures.
 	auto newSwapChainBuffer = std::make_unique<WrappedResource>(texDesc11, d3d11Device.get(), d3d12Device.get());
 
+	// DLSS-G HUD-less input: same size and format as the backbuffer (required by DLSS-G).
+	std::unique_ptr<WrappedResource> newHudlessBuffer;
+	if (useDLSSG)
+		newHudlessBuffer = std::make_unique<WrappedResource>(texDesc11, d3d11Device.get(), d3d12Device.get());
+
 	// UI buffer uses R8G8B8A8_UNORM - vanilla UI is SDR and 8-bit precision
 	texDesc11.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	auto newUiBuffer = std::make_unique<WrappedResource>(texDesc11, d3d11Device.get(), d3d12Device.get());
 
 	delete swapChainBufferWrapped;
 	delete uiBufferWrapped;
+	delete hudlessBufferWrapped;
 	swapChainBufferWrapped = newSwapChainBuffer.release();
 	uiBufferWrapped = newUiBuffer.release();
+	hudlessBufferWrapped = newHudlessBuffer.release();
 
 	const float clearColor[4]{};
 	d3d11Context->ClearRenderTargetView(swapChainBufferWrapped->rtv, clearColor);
 	d3d11Context->ClearRenderTargetView(uiBufferWrapped->rtv, clearColor);
+	if (hudlessBufferWrapped)
+		d3d11Context->ClearRenderTargetView(hudlessBufferWrapped->rtv, clearColor);
 }
 
 DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
@@ -307,6 +479,17 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	bool isHDR = hdr && hdr->settings.enableHDR;
 
+	const bool useFrameGeneration = upscaling.ShouldUseFrameGenerationThisFrame();
+
+	// DLSS-G does not composite UI itself. When frame generation routed this frame's UI into
+	// uiBufferWrapped (HDRDisplay::SetUIBuffer), composite it here on D3D11 and keep a HUD-less
+	// copy of the scene, so DLSS-G gets HUD-less color + UI color/alpha and leaves the HUD out of
+	// the interpolation. Runs before the fence signal so D3D12 sees the finished images.
+	bool dlssgUISeparated = false;
+	if (useDLSSG && uiRoutedForFGComposite)
+		dlssgUISeparated = ComposeUIForDLSSG();
+	uiRoutedForFGComposite = false;
+
 	// Wait for D3D11 to finish (includes ApplyHDR scene encoding AND UIBrightnessCS)
 	fenceValue++;
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
@@ -339,18 +522,42 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		}
 	}
 
+	// The frame being presented: State::Reset() already advanced frameCount for the next frame
+	// before this present ran, so the frame whose Reflex sleep/markers used frameCount is - 1.
+	const uint32_t presentFrameIndex = globals::state ? globals::state->frameCount - 1 : 0;
+
 	if (useDLSSG) {
-		auto& sl = upscaling.streamlineDX12;
-		sl.EnsureFrameToken();
-		sl.CheckFrameConstants(sl.viewport);
-		sl.TagDX12Resources(commandLists[frameIndex].get(),
-			depthBufferShared12 ? depthBufferShared12->resource.get() : nullptr,
-			motionVectorBufferShared12 ? motionVectorBufferShared12->resource.get() : nullptr,
-			swapChainBufferWrapped ? swapChainBufferWrapped->resource.get() : nullptr,
-			swapChainDesc.Width, swapChainDesc.Height);
-		sl.ConfigureDLSSG(upscaling.ShouldUseFrameGenerationThisFrame());
+		auto& slDX12 = upscaling.streamlineDX12;
+		const bool dlssgEnabled = useFrameGeneration && slDX12.featureDLSSG && depthBufferShared12 && motionVectorBufferShared12;
+
+		if (auto* token = slDX12.GetFrameToken(presentFrameIndex)) {
+			slDX12.SetFrameConstants(*token, slDX12.viewport);
+
+			if (dlssgEnabled) {
+				// Depth and motion vectors are copied before upscaling (render resolution, top-left
+				// sub-rect when an upscaler is active); HUD-less and UI match the backbuffer.
+				const float2 screenSize{ (float)globals::game::graphicsState->screenWidth, (float)globals::game::graphicsState->screenHeight };
+				const float2 renderSize = screenSize * upscaling.resolutionScale;
+				const sl::Extent renderExtent{ 0, 0,
+					std::clamp(static_cast<uint32_t>(renderSize.x), 1u, swapChainDesc.Width),
+					std::clamp(static_cast<uint32_t>(renderSize.y), 1u, swapChainDesc.Height) };
+				const sl::Extent backbufferExtent{ 0, 0, swapChainDesc.Width, swapChainDesc.Height };
+
+				slDX12.TagDLSSGResources(*token, commandLists[frameIndex].get(),
+					depthBufferShared12->resource.get(),
+					motionVectorBufferShared12->resource.get(),
+					renderExtent,
+					dlssgUISeparated ? hudlessBufferWrapped->resource.get() : nullptr,
+					dlssgUISeparated ? uiBufferWrapped->resource.get() : nullptr,
+					backbufferExtent);
+			}
+		}
+
+		// Keep DLSS-G's resources while frame generation is only paused (menus); release them when
+		// frame generation is switched off in the settings.
+		slDX12.ConfigureDLSSG(dlssgEnabled, upscaling.settings.frameGenerationMode != 0, upscaling.settings.dlssgFramesToGenerate);
 	} else {
-		upscaling.fidelityFX.Present(upscaling.ShouldUseFrameGenerationThisFrame(), isHDR);
+		upscaling.fidelityFX.Present(useFrameGeneration, isHDR);
 	}
 
 	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
@@ -358,8 +565,20 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
 	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
 
-	// Present the frame
-	DX::ThrowIfFailed(swapChain->Present(SyncInterval, Flags));
+	// Present the frame. DLSS-G matches the presented frame to its constants/tags through the
+	// ePresentStart marker, so the markers carry the same frame index.
+	if (useDLSSG) {
+		auto& slDX12 = upscaling.streamlineDX12;
+		slDX12.SetPCLMarker(sl::PCLMarker::eRenderSubmitEnd, presentFrameIndex);
+		slDX12.SetPCLMarker(sl::PCLMarker::ePresentStart, presentFrameIndex);
+	}
+	const HRESULT presentResult = swapChain->Present(SyncInterval, Flags);
+	if (useDLSSG) {
+		auto& slDX12 = upscaling.streamlineDX12;
+		slDX12.SetPCLMarker(sl::PCLMarker::ePresentEnd, presentFrameIndex);
+		slDX12.QueryDLSSGState(commandQueue.get(), slDX12.dlssgEnabledLastFrame);
+	}
+	DX::ThrowIfFailed(presentResult);
 
 	// Wait for D3D12 to finish
 	fenceValue++;
