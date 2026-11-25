@@ -344,18 +344,16 @@ void Upscaling::DrawSettings()
 
 		auto fgMethod = GetFrameGenMethod();
 		if (fgMethod == FrameGenMethod::kDLSSG) {
-			ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", T(TKEY("frame_generation_dlssg_active"),
-				"Using NVIDIA DLSS Frame Generation"));
+			ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", T(TKEY("frame_generation_dlssg_active"), "Using NVIDIA DLSS Frame Generation"));
 		} else if (fgMethod == FrameGenMethod::kFSR) {
-			ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "%s", T(TKEY("frame_generation_fsr_active"),
-				"Using AMD FSR Frame Generation"));
+			ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "%s", T(TKEY("frame_generation_fsr_active"), "Using AMD FSR Frame Generation"));
 		} else {
 			if (streamlineDX12.featureDLSSG)
 				ImGui::Text("%s", T(TKEY("frame_generation_dlssg_available"),
-					"NVIDIA DLSS Frame Generation is available."));
+									  "NVIDIA DLSS Frame Generation is available."));
 			else if (fidelityFX.featureFSR3FG)
 				ImGui::Text("%s", T(TKEY("frame_generation_fsr_available"),
-					"AMD FSR Frame Generation is available."));
+									  "AMD FSR Frame Generation is available."));
 		}
 
 		ImGui::Text("%s", T(TKEY("frame_generation_proxy_note"),

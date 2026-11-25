@@ -183,9 +183,9 @@ public:
 	virtual void ClearShaderCache() override;
 
 	// Static instances instead of singletons
-	static inline Streamline streamline;        ///< DX11 instance: DLSS + Reflex + PCL
-	static inline Streamline streamlineDX12;    ///< DX12 instance: DLSS-G frame generation
-	static inline FidelityFX fidelityFX;        ///< AMD FSR frame generation
+	static inline Streamline streamline;      ///< DX11 instance: DLSS + Reflex + PCL
+	static inline Streamline streamlineDX12;  ///< DX12 instance: DLSS-G frame generation
+	static inline FidelityFX fidelityFX;      ///< AMD FSR frame generation
 	static inline DX12SwapChain dx12SwapChain;
 	static inline RCAS rcas;  ///< Standalone RCAS sharpening for DLSS
 

@@ -2,10 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
-#include <format>
-#include <string>
 #include <dxgi.h>
 #include <dxgi1_3.h>
+#include <format>
+#include <string>
 
 #include "../../Deferred.h"
 #include "../../Hooks.h"
@@ -407,7 +407,6 @@ void Streamline::PostDevice()
 
 	reflexOptionsCache = {};
 	lastReflexSleepFrame = UINT32_MAX;
-
 }
 
 bool Streamline::SetD3DDevice12(ID3D12Device* a_device)
