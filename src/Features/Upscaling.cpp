@@ -40,7 +40,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexUseFPSLimit,
 	reflexFPSLimit,
 	dlssgFramesToGenerate,
-	frameGenerationPreferDLSSG);
+	frameGenerationPreferDLSSG,
+	dlssgDynamic,
+	dlssgDynamicTargetFps,
+	dlssgUIRecomposition,
+	frameGenerationReflexMode,
+	frameGenerationPipelined,
+	fsrFGPacingSafetyMarginMs,
+	fsrFGPacingVarianceFactor);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
@@ -412,6 +419,23 @@ void Upscaling::DrawSettings()
 			ImGui::TextUnformatted(T(TKEY("frame_generation_in_menus_tooltip_2"), "May feel smoother, but increases menu input latency."));
 		}
 
+		ImGui::Checkbox(T(TKEY("frame_generation_pipelined"), "Pipelined Frame Generation Hand-off"), &settings.frameGenerationPipelined);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted(T(TKEY("frame_generation_pipelined_tooltip_1"), "Copies each frame's inputs into a 3-deep ring and lets the game render the next frame without waiting for the frame-generation present."));
+			ImGui::TextUnformatted(T(TKEY("frame_generation_pipelined_tooltip_2"), "Switches live; the 3 swap-chain buffers it uses are set at startup."));
+		}
+		if (frameGenerationDx12PathActive && dx12SwapChain.proxyBufferCount != DX12SwapChain::GetLaunchBufferCount())
+			Util::Text::Warning("Warning: Swap-chain buffer count changes on restart");
+
+		if (frameGenerationDx12PathActive && !UsesDLSSGFrameGen()) {
+			ImGui::SliderFloat(T(TKEY("fsr_fg_pacing_margin"), "FSR FG Pacing Safety Margin (ms)"), &settings.fsrFGPacingSafetyMarginMs, 0.0f, 2.0f, "%.2f");
+			ImGui::SliderFloat(T(TKEY("fsr_fg_pacing_variance"), "FSR FG Pacing Variance Factor"), &settings.fsrFGPacingVarianceFactor, 0.0f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(T(TKEY("fsr_fg_pacing_tooltip_1"), "AMD defaults are 0.1 ms and 0.1. AMD recommends 0.01 ms and 0.3 when frame generation stays stuck at a low frame rate."));
+				ImGui::TextUnformatted(T(TKEY("fsr_fg_pacing_tooltip_2"), "Applies immediately."));
+			}
+		}
+
 		if (streamlineDX12.featureDLSSG || UsesDLSSGFrameGen()) {
 			ImGui::Separator();
 
@@ -423,13 +447,29 @@ void Upscaling::DrawSettings()
 			if (frameGenerationDx12PathActive && settings.frameGenerationPreferDLSSG != UsesDLSSGFrameGen())
 				Util::Text::Warning("Warning: Requires restart");
 
-			const char* multiplierLabels[] = { "2x", "3x", "4x" };
+			const char* multiplierLabels[] = { "2x", "3x", "4x", "5x", "6x" };
 			int multiplierIndex = static_cast<int>(std::clamp(settings.dlssgFramesToGenerate, 1u, kDLSSGMaxFramesToGenerate)) - 1;
 			if (ImGui::Combo(T(TKEY("dlssg_multiplier"), "DLSS Frame Generation Multiplier"), &multiplierIndex, multiplierLabels, IM_ARRAYSIZE(multiplierLabels)))
 				settings.dlssgFramesToGenerate = static_cast<uint>(multiplierIndex) + 1;
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted(T(TKEY("dlssg_multiplier_tooltip_1"), "Displayed frames per rendered frame. 3x and 4x (multi frame generation) need an RTX 50 series GPU."));
-				ImGui::TextUnformatted(T(TKEY("dlssg_multiplier_tooltip_2"), "Values above what the GPU supports fall back to the highest supported multiplier. Applies immediately."));
+				ImGui::TextUnformatted(T(TKEY("dlssg_multiplier_tooltip_1"), "Displayed frames per rendered frame. 3x and above (multi frame generation) need an RTX 50 series GPU."));
+				ImGui::TextUnformatted(T(TKEY("dlssg_multiplier_tooltip_2"), "Values above what the GPU supports fall back to the highest supported multiplier. Ignored while Dynamic Multi Frame Generation runs. Applies immediately."));
+			}
+
+			ImGui::Checkbox(T(TKEY("dlssg_dynamic"), "Dynamic Multi Frame Generation"), &settings.dlssgDynamic);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(T(TKEY("dlssg_dynamic_tooltip_1"), "Lets DLSS pick the multiplier every frame so the presented frame rate tracks the target."));
+				ImGui::TextUnformatted(T(TKEY("dlssg_dynamic_tooltip_2"), "Needs driver 595.41 or newer and a multi frame generation GPU. Applies immediately."));
+			}
+			if (settings.dlssgDynamic) {
+				ImGui::SliderFloat(T(TKEY("dlssg_dynamic_target"), "Dynamic Target FPS (0 = refresh rate)"), &settings.dlssgDynamicTargetFps, 0.0f, 360.0f, "%.0f");
+				if (UsesDLSSGFrameGen() && !streamlineDX12.dlssgDynamicSupported)
+					ImGui::TextDisabled("%s", T(TKEY("dlssg_dynamic_unsupported"), "Dynamic Multi Frame Generation is not supported here; the fixed multiplier is used."));
+			}
+
+			ImGui::Checkbox(T(TKEY("dlssg_ui_recomposition"), "UI Recomposition"), &settings.dlssgUIRecomposition);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(T(TKEY("dlssg_ui_recomposition_tooltip"), "Interpolates the HUD-less scene and the UI separately for cleaner UI. Slight performance and memory cost."));
 			}
 
 			if (UsesDLSSGFrameGen()) {
@@ -437,6 +477,8 @@ void Upscaling::DrawSettings()
 					ImGui::Text("%s %ux", T(TKEY("dlssg_supported_up_to"), "GPU supports up to"), streamlineDX12.dlssgFramesToGenerateMax + 1);
 				if (streamlineDX12.dlssgFramesToGenerateActive > 0)
 					ImGui::Text("%s %ux", T(TKEY("dlssg_running_at"), "Running at"), streamlineDX12.dlssgFramesToGenerateActive + 1);
+				if (streamlineDX12.dlssgDynamicActive)
+					ImGui::Text("%s %ux", T(TKEY("dlssg_dynamic_running_at"), "Dynamic, presenting"), streamlineDX12.dlssgObservedMultiplier);
 				if (streamlineDX12.dlssgStatus != sl::DLSSGStatus::eOk)
 					Util::Text::Warning("DLSS Frame Generation reported a problem (status 0x%x), see CommunityShaders.log", static_cast<uint32_t>(streamlineDX12.dlssgStatus));
 				if (!dx12SwapChain.CanSeparateUIForDLSSG())
@@ -459,6 +501,20 @@ void Upscaling::DrawSettings()
 
 		if (usingDX12Reflex) {
 			ImGui::Text("%s", T(TKEY("reflex_via_dx12"), "Reflex is running via DX12 (DLSS Frame Generation active)."));
+
+			const char* reflexOverrideLabels[] = {
+				T(TKEY("fg_reflex_default"), "Default (forced on while frame generation runs)"),
+				T(TKEY("fg_reflex_off"), "Off"),
+				T(TKEY("fg_reflex_on"), "On"),
+				T(TKEY("fg_reflex_boost"), "On + Boost")
+			};
+			int reflexOverrideIndex = std::clamp(settings.frameGenerationReflexMode, -1, 2) + 1;
+			if (ImGui::Combo(T(TKEY("fg_reflex_mode"), "Frame Generation Reflex Mode"), &reflexOverrideIndex, reflexOverrideLabels, IM_ARRAYSIZE(reflexOverrideLabels)))
+				settings.frameGenerationReflexMode = reflexOverrideIndex - 1;
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(T(TKEY("fg_reflex_mode_tooltip_1"), "Test override for the DLSS Frame Generation Reflex mode. DLSS Frame Generation expects Reflex on."));
+				ImGui::TextUnformatted(T(TKEY("fg_reflex_mode_tooltip_2"), "Applies immediately; the effective mode and the Reflex sleep cost are written to CommunityShaders.log."));
+			}
 		}
 
 		if (!reflexAvailable) {
@@ -602,6 +658,22 @@ void Upscaling::LoadSettings(json& o_json)
 		const uint clampedFrames = std::clamp(settings.dlssgFramesToGenerate, 1u, kDLSSGMaxFramesToGenerate);
 		logger::warn("[Upscaling] Loaded dlssgFramesToGenerate {} out of range, clamping to {}", settings.dlssgFramesToGenerate, clampedFrames);
 		settings.dlssgFramesToGenerate = clampedFrames;
+	}
+	if (!std::isfinite(settings.dlssgDynamicTargetFps) || settings.dlssgDynamicTargetFps < 0.0f || settings.dlssgDynamicTargetFps > 1000.0f) {
+		logger::warn("[Upscaling] Loaded dlssgDynamicTargetFps {} out of range, using the display refresh rate", settings.dlssgDynamicTargetFps);
+		settings.dlssgDynamicTargetFps = 0.0f;
+	}
+	if (settings.frameGenerationReflexMode < -1 || settings.frameGenerationReflexMode > 2) {
+		logger::warn("[Upscaling] Loaded frameGenerationReflexMode {} out of range, using -1 (default)", settings.frameGenerationReflexMode);
+		settings.frameGenerationReflexMode = -1;
+	}
+	if (!std::isfinite(settings.fsrFGPacingSafetyMarginMs) || settings.fsrFGPacingSafetyMarginMs < 0.0f || settings.fsrFGPacingSafetyMarginMs > 5.0f) {
+		logger::warn("[Upscaling] Loaded fsrFGPacingSafetyMarginMs {} out of range, using 0.1", settings.fsrFGPacingSafetyMarginMs);
+		settings.fsrFGPacingSafetyMarginMs = 0.1f;
+	}
+	if (!std::isfinite(settings.fsrFGPacingVarianceFactor) || settings.fsrFGPacingVarianceFactor < 0.0f || settings.fsrFGPacingVarianceFactor > 1.0f) {
+		logger::warn("[Upscaling] Loaded fsrFGPacingVarianceFactor {} out of range, using 0.1", settings.fsrFGPacingVarianceFactor);
+		settings.fsrFGPacingVarianceFactor = 0.1f;
 	}
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
 	if (iniSettingCollection) {
@@ -1231,7 +1303,15 @@ void Upscaling::FrameLimiter()
 		if (waitableObject)
 			WaitForSingleObject(waitableObject, INFINITE);
 
-		if (settings.frameLimitMode) {
+		// NVIDIA: Dynamic MFG is designed for the Reflex frame limiter; other limiters may fight it.
+		const bool dynamicMFGActive = UsesDLSSGFrameGen() && streamlineDX12.dlssgDynamicActive;
+		static bool dynamicLimiterBypassLogged = false;
+		if (settings.frameLimitMode && dynamicMFGActive && !dynamicLimiterBypassLogged) {
+			dynamicLimiterBypassLogged = true;
+			logger::info("[Frame Generation] CS frame limiter bypassed while DLSS-G Dynamic MFG runs (use the Reflex FPS limit instead)");
+		}
+
+		if (settings.frameLimitMode && !dynamicMFGActive) {
 			static constexpr int64_t kNanosecondsPerSecond = 1000000000LL;
 			// Cap rendered frames at refresh / multiplier so displayed frames land on the refresh
 			// rate (2x for FSR, up to 4x for DLSS multi-frame generation).
@@ -1446,8 +1526,12 @@ uint32_t Upscaling::GetFrameGenerationMultiplier() const
 {
 	if (!IsFrameGenerationActive())
 		return 1;
-	if (UsesDLSSGFrameGen())
+	if (UsesDLSSGFrameGen()) {
+		// Dynamic MFG picks the multiplier itself; report what was measured at present time.
+		if (streamlineDX12.dlssgDynamicActive)
+			return std::max(streamlineDX12.dlssgObservedMultiplier, 2u);
 		return std::max(streamlineDX12.dlssgFramesToGenerateActive, 1u) + 1;
+	}
 	return 2;
 }
 

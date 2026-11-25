@@ -61,10 +61,15 @@ public:
 class DX12SwapChain
 {
 public:
+	static constexpr UINT kLegacyBufferCount = 2;     ///< Proxy swap-chain buffers on the serialized hand-off
+	static constexpr UINT kPipelinedBufferCount = 3;  ///< Proxy swap-chain buffers on the pipelined hand-off
+	static constexpr UINT kMaxBufferCount = 3;        ///< Size of every array indexed by frameIndex
+	static constexpr UINT kFrameRingSize = 3;         ///< Depth of the D3D12-private frame-input ring
+
 	winrt::com_ptr<ID3D12Device> d3d12Device;
 	winrt::com_ptr<ID3D12CommandQueue> commandQueue;
-	winrt::com_ptr<ID3D12CommandAllocator> commandAllocators[2];
-	winrt::com_ptr<ID3D12GraphicsCommandList4> commandLists[2];
+	winrt::com_ptr<ID3D12CommandAllocator> commandAllocators[kMaxBufferCount];
+	winrt::com_ptr<ID3D12GraphicsCommandList4> commandLists[kMaxBufferCount];
 
 	IDXGISwapChain4* swapChain;
 
@@ -80,15 +85,46 @@ public:
 	winrt::com_ptr<ID3D11Device5> d3d11Device;
 	winrt::com_ptr<ID3D11DeviceContext4> d3d11Context;
 
+	// D3D12 -> D3D11/CPU fence: only the D3D12 queue signals it (fenceValue), D3D11 and the CPU wait.
 	winrt::com_ptr<ID3D11Fence> d3d11Fence;
 	winrt::com_ptr<ID3D12Fence> d3d12Fence;
 
-	winrt::com_ptr<ID3D12Resource> swapChainBuffers[2];
+	// D3D11 -> D3D12 fence: D3D11 signals "frame inputs written" (inputReadyValue), D3D12 waits.
+	// Separate from d3d12Fence so the two devices never signal the same fence out of order once
+	// D3D11 no longer waits for the frame-generation present.
+	winrt::com_ptr<ID3D11Fence> inputReadyFence11;
+	winrt::com_ptr<ID3D12Fence> inputReadyFence12;
+	UINT64 inputReadyValue = 0;
+
+	winrt::com_ptr<ID3D12Resource> swapChainBuffers[kMaxBufferCount];
 
 	UINT frameIndex = 0;
 	UINT64 fenceValue = 0;
 
-	UINT64 frameFenceValues[2] = {0, 0};
+	UINT64 frameFenceValues[kMaxBufferCount] = {};
+
+	// Swap-chain buffer count chosen at creation (Upscaling.frameGenerationPipelined at launch).
+	UINT proxyBufferCount = kLegacyBufferCount;
+
+	// Pipelined hand-off: each frame the D3D12 queue copies the D3D11-written inputs into a private
+	// ring slot and signals D3D11 right after the copy; frame generation then reads only the slot.
+	struct FrameRingSlot
+	{
+		winrt::com_ptr<ID3D12Resource> scene;
+		winrt::com_ptr<ID3D12Resource> ui;
+		winrt::com_ptr<ID3D12Resource> hudless;
+		winrt::com_ptr<ID3D12Resource> depth;
+		winrt::com_ptr<ID3D12Resource> motionVectors;
+	};
+	FrameRingSlot frameRing[kFrameRingSize];
+	winrt::com_ptr<ID3D12CommandAllocator> ringCopyAllocators[kFrameRingSize];
+	winrt::com_ptr<ID3D12GraphicsCommandList> ringCopyLists[kFrameRingSize];
+	UINT64 ringCopyFenceValues[kFrameRingSize] = {};
+	ID3D12Resource* frameRingSources[5] = {};  ///< Shared resources the ring was built from (rebuild on change)
+	bool frameRingReady = false;
+	bool frameRingFailed = false;
+	UINT64 presentCounter = 0;
+	int loggedHandOffMode = -1;  ///< -1 not logged yet, 0 serialized, 1 pipelined
 
 	LARGE_INTEGER qpf;
 
@@ -167,7 +203,22 @@ public:
 	// D3D12 interop resource management
 	void CreateSharedResources();
 
+	/** @brief Swap-chain buffer count for a new proxy swap chain (3 when the hand-off is pipelined at launch). */
+	static UINT GetLaunchBufferCount();
+
 private:
+	/**
+	 * @brief Creates (or rebuilds after a resize) the D3D12-private frame-input ring.
+	 * @return True if the ring matches the current shared resources and can be used this frame.
+	 */
+	bool EnsureFrameRing();
+
+	/** @brief Drops the frame-input ring (callers make sure the GPU no longer uses it). */
+	void ReleaseFrameRing();
+
+	/** @brief Blocks the CPU until everything queued on the D3D12 queue has executed. */
+	void WaitForGPUIdle();
+
 	/**
 	 * @brief DLSS-G: keeps a HUD-less copy of the scene and composites the UI onto the backbuffer on D3D11.
 	 * @return True if the backbuffer now contains scene + UI and the HUD-less copy is valid.

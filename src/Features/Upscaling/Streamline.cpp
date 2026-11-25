@@ -789,7 +789,7 @@ void Streamline::UpdateReflex()
 	if (!initialized || !reflexSupportedOnCurrentAdapter || !featureReflex || !slReflexSetOptions)
 		return;
 
-	const auto applyReflexOptionsIfChanged = [&](const sl::ReflexOptions& options, const char* onFailMessage) {
+	const auto applyReflexOptionsIfChanged = [&](const sl::ReflexOptions& options, const char* source, const char* onFailMessage) {
 		if (reflexOptionsCache.valid &&
 			reflexOptionsCache.mode == options.mode &&
 			reflexOptionsCache.frameLimitUs == options.frameLimitUs &&
@@ -802,10 +802,20 @@ void Streamline::UpdateReflex()
 			return;
 		}
 
+		logger::info("[Streamline {}] Reflex mode {} ({}), frame limit {} us, markers to optimize {}",
+			instanceTag, magic_enum::enum_name(options.mode), source, options.frameLimitUs, options.useMarkersToOptimize);
+
 		reflexOptionsCache.valid = true;
 		reflexOptionsCache.mode = options.mode;
 		reflexOptionsCache.frameLimitUs = options.frameLimitUs;
 		reflexOptionsCache.useMarkersToOptimize = options.useMarkersToOptimize;
+
+		// Re-arm the one-shot sleep measurement so each mode gets its own summary line.
+		reflexModeSource = source;
+		reflexSleepSamples = 0;
+		reflexSleepTotalMs = 0.0;
+		reflexSleepMaxMs = 0.0;
+		reflexSleepStatsLogged = false;
 	};
 
 	const auto& upscaling = globals::features::upscaling;
@@ -817,20 +827,34 @@ void Streamline::UpdateReflex()
 		disabledOptions.mode = sl::ReflexMode::eOff;
 		disabledOptions.frameLimitUs = 0u;
 		disabledOptions.useMarkersToOptimize = false;
-		applyReflexOptionsIfChanged(disabledOptions, "Failed to disable Reflex while frame-generation DX12 path is active");
+		applyReflexOptionsIfChanged(disabledOptions, "disabled while the DX12 frame-generation path is active",
+			"Failed to disable Reflex while frame-generation DX12 path is active");
 		return;
 	}
 
 	auto& settings = upscaling.settings;
 
 	sl::ReflexOptions options{};
+	const char* modeSource = "Low Latency settings";
 	if (renderAPI == sl::RenderAPI::eD3D12) {
-		// DX12 Reflex: DLSS-G requires at least eLowLatency when FG is active
-		bool needReflex = upscaling.ShouldUseFrameGenerationThisFrame() || settings.reflexLowLatencyMode;
-		if (needReflex)
-			options.mode = settings.reflexLowLatencyBoost ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency;
-		else
-			options.mode = sl::ReflexMode::eOff;
+		const int reflexOverride = settings.frameGenerationReflexMode;
+		if (reflexOverride >= 0) {
+			// Test override (Upscaling.frameGenerationReflexMode), honoured even while DLSS-G runs.
+			options.mode = reflexOverride == 0 ? sl::ReflexMode::eOff :
+			               reflexOverride == 1 ? sl::ReflexMode::eLowLatency :
+			                                     sl::ReflexMode::eLowLatencyWithBoost;
+			modeSource = "frameGenerationReflexMode override";
+		} else {
+			// DX12 Reflex: DLSS-G requires at least eLowLatency when FG is active
+			const bool frameGenerationThisFrame = upscaling.ShouldUseFrameGenerationThisFrame();
+			bool needReflex = frameGenerationThisFrame || settings.reflexLowLatencyMode;
+			if (needReflex)
+				options.mode = settings.reflexLowLatencyBoost ? sl::ReflexMode::eLowLatencyWithBoost : sl::ReflexMode::eLowLatency;
+			else
+				options.mode = sl::ReflexMode::eOff;
+			if (frameGenerationThisFrame && !settings.reflexLowLatencyMode)
+				modeSource = "forced on by DLSS frame generation";
+		}
 	} else {
 		if (!settings.reflexLowLatencyMode)
 			options.mode = sl::ReflexMode::eOff;
@@ -847,7 +871,7 @@ void Streamline::UpdateReflex()
 	options.frameLimitUs = settings.reflexUseFPSLimit ? static_cast<uint32_t>(std::lround(1000000.0 / static_cast<double>(fpsLimit))) : 0u;
 	options.useMarkersToOptimize = settings.reflexUseMarkersToOptimize && featurePCL;
 
-	applyReflexOptionsIfChanged(options, "Failed to apply Reflex options");
+	applyReflexOptionsIfChanged(options, modeSource, "Failed to apply Reflex options");
 
 	if (!slReflexSleep)
 		return;
@@ -872,8 +896,30 @@ void Streamline::UpdateReflex()
 		return;
 
 	lastReflexSleepFrame = currentFrame;
+
+	static LARGE_INTEGER qpcFrequency = {};
+	if (qpcFrequency.QuadPart == 0)
+		QueryPerformanceFrequency(&qpcFrequency);
+	LARGE_INTEGER sleepStart;
+	QueryPerformanceCounter(&sleepStart);
+
 	if (SL_FAILED(result, slReflexSleep(*token))) {
 		logger::warn("[Streamline {}] Reflex sleep call failed: {}", instanceTag, magic_enum::enum_name(result));
+	}
+
+	// One summary per effective mode: how long the Reflex sleep holds the game thread each frame.
+	LARGE_INTEGER sleepEnd;
+	QueryPerformanceCounter(&sleepEnd);
+	const double sleepMs = static_cast<double>(sleepEnd.QuadPart - sleepStart.QuadPart) * 1000.0 / static_cast<double>(qpcFrequency.QuadPart);
+	if (!reflexSleepStatsLogged) {
+		reflexSleepTotalMs += sleepMs;
+		reflexSleepMaxMs = std::max(reflexSleepMaxMs, sleepMs);
+		if (++reflexSleepSamples >= 600) {
+			reflexSleepStatsLogged = true;
+			logger::info("[Streamline {}] Reflex sleep in mode {} ({}): average {:.2f} ms, max {:.2f} ms per frame over {} frames, frame limit {} us",
+				instanceTag, magic_enum::enum_name(options.mode), reflexModeSource, reflexSleepTotalMs / reflexSleepSamples,
+				reflexSleepMaxMs, reflexSleepSamples, options.frameLimitUs);
+		}
 	}
 
 	if (renderAPI == sl::RenderAPI::eD3D12)
@@ -906,7 +952,8 @@ namespace
 	}
 }
 
-void Streamline::ConfigureDLSSG(bool enabled, bool retainResources, uint32_t requestedFramesToGenerate)
+void Streamline::ConfigureDLSSG(bool enabled, bool retainResources, uint32_t requestedFramesToGenerate,
+	bool dynamic, float dynamicTargetFps, bool uiRecomposition)
 {
 	if (!initialized || !slDLSSGSetOptions)
 		return;
@@ -915,15 +962,34 @@ void Streamline::ConfigureDLSSG(bool enabled, bool retainResources, uint32_t req
 	// query has reported the GPU's maximum, only 2x (one generated frame) is known to be valid.
 	const uint32_t maxFramesToGenerate = std::max(dlssgFramesToGenerateMax, 1u);
 	const uint32_t framesToGenerate = std::clamp(requestedFramesToGenerate, 1u, maxFramesToGenerate);
+	// Dynamic MFG only when the GPU/driver report it (driver 595.41+, multi-frame capable GPU, D3D12).
+	bool useDynamic = enabled && dynamic && dlssgDynamicSupported;
+	const float targetFps = std::isfinite(dynamicTargetFps) ? std::max(dynamicTargetFps, 0.0f) : 0.0f;
 
 	sl::DLSSGOptions options{};
-	options.mode = enabled ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-	options.numFramesToGenerate = framesToGenerate;
+	options.mode = !enabled ? sl::DLSSGMode::eOff : (useDynamic ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn);
+	options.numFramesToGenerate = framesToGenerate;  // ignored by SL while eDynamic is active
+	options.dynamicTargetFrameRate = useDynamic ? targetFps : 0.0f;
+	options.enableUserInterfaceRecomposition = uiRecomposition ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	if (retainResources)
 		options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
 
 	sl::Result result = slDLSSGSetOptions(viewport, options);
-	if (result != sl::Result::eOk && enabled && framesToGenerate > 1) {
+	if (result != sl::Result::eOk && useDynamic) {
+		// Fall back to the fixed multiplier rather than losing frame generation entirely.
+		options.mode = sl::DLSSGMode::eOn;
+		options.dynamicTargetFrameRate = 0.0f;
+		const sl::Result fallbackResult = slDLSSGSetOptions(viewport, options);
+		static bool dynamicFallbackLogged = false;
+		if (!dynamicFallbackLogged) {
+			dynamicFallbackLogged = true;
+			logger::warn("[Streamline DX12] slDLSSGSetOptions with Dynamic MFG failed ({}); falling back to a fixed {}x: {}",
+				magic_enum::enum_name(result), framesToGenerate + 1, magic_enum::enum_name(fallbackResult));
+		}
+		useDynamic = false;
+		result = fallbackResult;
+	}
+	if (result != sl::Result::eOk && enabled && options.numFramesToGenerate > 1) {
 		// Fall back to 2x rather than losing frame generation entirely.
 		options.numFramesToGenerate = 1;
 		const sl::Result fallbackResult = slDLSSGSetOptions(viewport, options);
@@ -944,18 +1010,32 @@ void Streamline::ConfigureDLSSG(bool enabled, bool retainResources, uint32_t req
 		}
 		dlssgFramesToGenerateActive = 0;
 		dlssgEnabledLastFrame = false;
+		dlssgDynamicActive = false;
 		return;
 	}
 
-	const uint32_t activeFrames = enabled ? options.numFramesToGenerate : 0;
-	if (activeFrames != dlssgFramesToGenerateActive) {
-		if (activeFrames)
-			logger::info("[Streamline DX12] DLSS-G on: {}x ({} generated frame(s) per rendered frame, GPU max {})",
-				activeFrames + 1, activeFrames, dlssgFramesToGenerateMax);
-		else
+	const uint32_t activeFrames = (enabled && !useDynamic) ? options.numFramesToGenerate : 0;
+	const float activeTarget = useDynamic ? targetFps : -1.0f;
+	const bool modeChanged = activeFrames != dlssgFramesToGenerateActive || useDynamic != dlssgDynamicActive ||
+	                         activeTarget != dlssgDynamicTargetApplied || enabled != dlssgEnabledLastFrame;
+	if (modeChanged) {
+		if (useDynamic) {
+			if (targetFps > 0.0f)
+				logger::info("[Streamline DX12] DLSS-G on: Dynamic MFG, target {:.1f} presented FPS (up to {}x){}",
+					targetFps, dlssgFramesToGenerateMax + 1, uiRecomposition ? ", UI recomposition" : "");
+			else
+				logger::info("[Streamline DX12] DLSS-G on: Dynamic MFG, target = display refresh rate (up to {}x){}",
+					dlssgFramesToGenerateMax + 1, uiRecomposition ? ", UI recomposition" : "");
+		} else if (activeFrames) {
+			logger::info("[Streamline DX12] DLSS-G on: {}x ({} generated frame(s) per rendered frame, GPU max {}){}",
+				activeFrames + 1, activeFrames, dlssgFramesToGenerateMax, uiRecomposition ? ", UI recomposition" : "");
+		} else {
 			logger::info("[Streamline DX12] DLSS-G off{}", retainResources ? " (resources retained)" : "");
+		}
 	}
 	dlssgFramesToGenerateActive = activeFrames;
+	dlssgDynamicActive = useDynamic;
+	dlssgDynamicTargetApplied = activeTarget;
 	dlssgEnabledLastFrame = enabled;
 }
 
@@ -1008,10 +1088,35 @@ void Streamline::QueryDLSSGState(ID3D12CommandQueue* presentQueue, bool waitForI
 		return;
 	}
 
-	if (state.numFramesToGenerateMax != dlssgFramesToGenerateMax) {
-		logger::info("[Streamline DX12] DLSS-G supports up to {} generated frame(s) per rendered frame ({}x)",
-			state.numFramesToGenerateMax, state.numFramesToGenerateMax + 1);
+	const bool dynamicSupported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+	if (!dlssgCapabilitiesLogged || state.numFramesToGenerateMax != dlssgFramesToGenerateMax || dynamicSupported != dlssgDynamicSupported) {
+		logger::info("[Streamline DX12] DLSS-G capabilities: numFramesToGenerateMax {} (up to {}x), bIsDynamicMFGSupported {}",
+			state.numFramesToGenerateMax, state.numFramesToGenerateMax + 1, dynamicSupported);
+		dlssgCapabilitiesLogged = true;
 		dlssgFramesToGenerateMax = state.numFramesToGenerateMax;
+		dlssgDynamicSupported = dynamicSupported;
+	}
+
+	// Measured multiplier: frames actually presented per rendered frame, averaged over a window so
+	// the asynchronous present thread does not make it jitter. Logged when it changes (this is the
+	// only way to see what Dynamic MFG is doing).
+	if (dlssgEnabledLastFrame) {
+		dlssgPresentedWindowSum += state.numFramesActuallyPresented;
+		if (++dlssgPresentedWindowCount >= 60) {
+			const double average = static_cast<double>(dlssgPresentedWindowSum) / static_cast<double>(dlssgPresentedWindowCount);
+			const uint32_t multiplier = static_cast<uint32_t>(std::lround(average));
+			if (multiplier != dlssgObservedMultiplier) {
+				logger::info("[Streamline DX12] DLSS-G presenting {:.2f} frames per rendered frame ({}x{})",
+					average, multiplier, dlssgDynamicActive ? ", dynamic" : "");
+				dlssgObservedMultiplier = multiplier;
+			}
+			dlssgPresentedWindowSum = 0;
+			dlssgPresentedWindowCount = 0;
+		}
+	} else {
+		dlssgPresentedWindowSum = 0;
+		dlssgPresentedWindowCount = 0;
+		dlssgObservedMultiplier = 0;
 	}
 
 	if (state.status != dlssgStatus) {

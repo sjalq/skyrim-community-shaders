@@ -75,14 +75,34 @@ public:
 		bool reflexUseFPSLimit = false;
 		float reflexFPSLimit = 60.0f;
 		// NVIDIA DLSS Frame Generation (DX12 Streamline). Generated frames per rendered frame:
-		// 1 = 2x, 2 = 3x, 3 = 4x (multi-frame generation, RTX 50 series). Clamped at runtime to
-		// what slDLSSGGetState reports as supported (numFramesToGenerateMax).
+		// 1 = 2x, 2 = 3x, 3 = 4x, 4 = 5x, 5 = 6x (multi-frame generation, RTX 50 series). Clamped at
+		// runtime to what slDLSSGGetState reports as supported (numFramesToGenerateMax).
 		uint dlssgFramesToGenerate = 3;
 		// Use DLSS-G instead of FSR frame generation when the GPU supports it (takes effect at restart).
 		bool frameGenerationPreferDLSSG = true;
+		// DLSS 4.5 Dynamic Multi Frame Generation (DLSSGMode::eDynamic): the multiplier adapts so the
+		// presented rate tracks the target. Used only while DLSSGState::bIsDynamicMFGSupported is true;
+		// dlssgFramesToGenerate is ignored while it runs. Applied live.
+		bool dlssgDynamic = true;
+		// Dynamic MFG target in presented frames per second; 0 = the display refresh rate (SL auto-detect).
+		float dlssgDynamicTargetFps = 0.0f;
+		// DLSS-G User Interface Recomposition: interpolate the HUD-less scene and the UI separately.
+		bool dlssgUIRecomposition = false;
+		// Reflex mode for the DX12 (DLSS-G) Streamline instance: -1 = default (forced on while frame
+		// generation runs, otherwise the Low Latency settings), 0 = off, 1 = on, 2 = on + boost. Applied live.
+		int frameGenerationReflexMode = -1;
+		// Pipelined frame-generation hand-off: the D3D12 side copies the D3D11 inputs into a 3-deep ring
+		// and releases D3D11 right away instead of after the frame-generation present, and the proxy swap
+		// chain uses 3 buffers (buffer count needs a restart; the hand-off itself switches live).
+		bool frameGenerationPipelined = true;
+		// FidelityFX frame-generation pacing tuning (FfxApiSwapchainFramePacingTuning), applied live.
+		// AMD defaults are 0.1 ms / 0.1; AMD documents 0.01 ms / 0.3 ("tuning set B") for FG that gets
+		// stuck at a low frame rate after heavy scenes.
+		float fsrFGPacingSafetyMarginMs = 0.1f;
+		float fsrFGPacingVarianceFactor = 0.1f;
 	};
 
-	static constexpr uint kDLSSGMaxFramesToGenerate = 3;  ///< 4x is the highest multiplier DLSS-G offers
+	static constexpr uint kDLSSGMaxFramesToGenerate = 5;  ///< 6x is the highest multiplier DLSS-G offers
 
 	Settings settings;
 

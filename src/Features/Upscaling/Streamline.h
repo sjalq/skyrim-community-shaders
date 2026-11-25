@@ -110,11 +110,26 @@ public:
 
 	// DLSS-G runtime state (DX12 instance only)
 	uint32_t dlssgFramesToGenerateMax = 0;     ///< Max generated frames per present reported by slDLSSGGetState (0 = not known yet)
-	uint32_t dlssgFramesToGenerateActive = 0;  ///< Generated frames per present in the last applied options (0 = DLSS-G off)
+	uint32_t dlssgFramesToGenerateActive = 0;  ///< Generated frames per present in the last applied fixed-multiplier options (0 = off or dynamic)
 	uint32_t dlssgFramesPresented = 0;         ///< Frames presented since the previous slDLSSGGetState call
 	sl::DLSSGStatus dlssgStatus = sl::DLSSGStatus::eOk;
 	bool dlssgVsyncSupportAvailable = false;
 	bool dlssgEnabledLastFrame = false;
+	bool dlssgDynamicSupported = false;       ///< DLSSGState::bIsDynamicMFGSupported
+	bool dlssgDynamicActive = false;          ///< DLSSGMode::eDynamic applied for the last present
+	float dlssgDynamicTargetApplied = -1.0f;  ///< dynamicTargetFrameRate of the last applied options (-1 = none)
+	bool dlssgCapabilitiesLogged = false;
+	uint32_t dlssgObservedMultiplier = 0;  ///< Presented frames per rendered frame, measured over a window of presents
+	uint32_t dlssgPresentedWindowSum = 0;
+	uint32_t dlssgPresentedWindowCount = 0;
+
+	// Reflex diagnostics: effective mode changes are logged, and the cost of the per-frame Reflex
+	// sleep is measured once per mode so the forced low-latency sleep can be judged from the log.
+	const char* reflexModeSource = "";
+	uint32_t reflexSleepSamples = 0;
+	double reflexSleepTotalMs = 0.0;
+	double reflexSleepMaxMs = 0.0;
+	bool reflexSleepStatsLogged = false;
 
 	/**
 	 * @brief Executes DLSS evaluation for a single viewport with the given resources.
@@ -163,10 +178,14 @@ public:
 	 * @brief Applies the DLSS-G options for the next present (DX12 instance only).
 	 * @param enabled True to run DLSS frame generation for the next present.
 	 * @param retainResources Keep DLSS-G resources allocated while it is temporarily off (menus).
-	 * @param requestedFramesToGenerate Generated frames per rendered frame (1 = 2x, 2 = 3x, 3 = 4x);
+	 * @param requestedFramesToGenerate Generated frames per rendered frame (1 = 2x ... 5 = 6x);
 	 *        clamped to the range the GPU reports via slDLSSGGetState.
+	 * @param dynamic Use Dynamic Multi Frame Generation (DLSSGMode::eDynamic) when supported.
+	 * @param dynamicTargetFps Dynamic MFG target frame rate; 0 = display refresh rate.
+	 * @param uiRecomposition Enable User Interface Recomposition (HUD-less and UI are both tagged).
 	 */
-	void ConfigureDLSSG(bool enabled, bool retainResources, uint32_t requestedFramesToGenerate);
+	void ConfigureDLSSG(bool enabled, bool retainResources, uint32_t requestedFramesToGenerate,
+		bool dynamic, float dynamicTargetFps, bool uiRecomposition);
 
 	/**
 	 * @brief Tags the DLSS-G inputs for a frame (DX12 instance only).

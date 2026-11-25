@@ -1,8 +1,10 @@
 #include "DX12SwapChain.h"
 
 #include <FidelityFX/api/include/dx12/ffx_api_dx12.hpp>
+#include <algorithm>
 #include <dxgi1_6.h>
 #include <format>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -23,11 +25,16 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
 
 	DX::ThrowIfFailed(d3d12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&commandQueue)));
 
-	for (int i = 0; i < 2; i++) {
+	for (UINT i = 0; i < kMaxBufferCount; i++) {
 		DX::ThrowIfFailed(d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocators[i])));
 		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(&commandLists[i])));
 		commandLists[i]->Close();
 	}
+}
+
+UINT DX12SwapChain::GetLaunchBufferCount()
+{
+	return globals::features::upscaling.settings.frameGenerationPipelined ? kPipelinedBufferCount : kLegacyBufferCount;
 }
 
 void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
@@ -67,7 +74,8 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 	swapChainDesc.Format = negotiatedFormat;
 	swapChainDesc.SampleDesc.Count = 1;
 	swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	swapChainDesc.BufferCount = 2;
+	proxyBufferCount = GetLaunchBufferCount();
+	swapChainDesc.BufferCount = proxyBufferCount;
 	swapChainDesc.SwapEffect = a_swapChainDesc.SwapEffect;
 	swapChainDesc.Flags = a_swapChainDesc.Flags;
 
@@ -85,25 +93,14 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 	if (ffx::CreateContext(fidelityFX.swapChainContext, nullptr, ffxSwapChainDesc) != ffx::ReturnCode::Ok) {
 		logger::critical("[FidelityFX] Failed to create swap chain context!");
 	} else {
-		// The default pacing tuning busy-spins the FG present/pacing threads and spin-waits on
-		// fences, burning up to a full CPU core each. Allow hybrid spin (sleep, then spin for the
-		// last 2 timer-resolution units) and WaitForSingleObject on fences instead. Safety margin
-		// and variance factor stay at the FidelityFX defaults (0.1 ms / 0.1).
-		static FfxApiSwapchainFramePacingTuning framePacingTuning{ 0.1f, 0.1f, true, 2, true };
-		ffx::ConfigureDescFrameGenerationSwapChainKeyValueDX12 pacingConfig{};
-		pacingConfig.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING;
-		pacingConfig.u64 = 0;
-		pacingConfig.ptr = &framePacingTuning;
-		if (ffx::Configure(fidelityFX.swapChainContext, pacingConfig) != ffx::ReturnCode::Ok)
-			logger::warn("[FidelityFX] Failed to apply frame pacing tuning (hybrid spin / fence wait)");
-		else
-			logger::info("[FidelityFX] Frame pacing tuning applied: safetyMargin={}ms variance={} hybridSpin={} spinTime={} waitOnFence={}",
-				framePacingTuning.safetyMarginInMs, framePacingTuning.varianceFactor, framePacingTuning.allowHybridSpin,
-				framePacingTuning.hybridSpinTime, framePacingTuning.allowWaitForSingleObjectOnFence);
+		// Hybrid spin + WaitForSingleObject on fences so the FG present/pacing threads stop
+		// busy-spinning; safety margin and variance come from the settings (live-adjustable).
+		const auto& settings = globals::features::upscaling.settings;
+		fidelityFX.ApplyFramePacingTuning(settings.fsrFGPacingSafetyMarginMs, settings.fsrFGPacingVarianceFactor);
 	}
 
-	DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(&swapChainBuffers[0])));
-	DX::ThrowIfFailed(swapChain->GetBuffer(1, IID_PPV_ARGS(&swapChainBuffers[1])));
+	for (UINT i = 0; i < proxyBufferCount; i++)
+		DX::ThrowIfFailed(swapChain->GetBuffer(i, IID_PPV_ARGS(&swapChainBuffers[i])));
 
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
 
@@ -121,13 +118,12 @@ bool DX12SwapChain::CreateSwapChainDLSSG(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_
 	auto& slDX12 = globals::features::upscaling.streamlineDX12;
 
 	const auto resetPartialState = [&]() {
-		swapChainBuffers[0] = nullptr;
-		swapChainBuffers[1] = nullptr;
 		if (swapChain) {
 			swapChain->Release();
 			swapChain = nullptr;
 		}
-		for (int i = 0; i < 2; i++) {
+		for (UINT i = 0; i < kMaxBufferCount; i++) {
+			swapChainBuffers[i] = nullptr;
 			commandLists[i] = nullptr;
 			commandAllocators[i] = nullptr;
 		}
@@ -178,7 +174,7 @@ bool DX12SwapChain::CreateSwapChainDLSSG(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_
 			throw std::runtime_error(std::format("slGetNativeInterface(ID3D12CommandQueue) failed: {}", magic_enum::enum_name(nativeResult)));
 		commandQueue.attach(static_cast<ID3D12CommandQueue*>(nativeQueue));
 
-		for (int i = 0; i < 2; i++) {
+		for (UINT i = 0; i < kMaxBufferCount; i++) {
 			DX::ThrowIfFailed(d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(commandAllocators[i].put())));
 			DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators[i].get(), nullptr, IID_PPV_ARGS(commandLists[i].put())));
 			commandLists[i]->Close();
@@ -224,7 +220,8 @@ bool DX12SwapChain::CreateSwapChainDLSSG(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_
 		swapChainDesc.Format = negotiatedFormat;
 		swapChainDesc.SampleDesc.Count = 1;
 		swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-		swapChainDesc.BufferCount = 2;
+		proxyBufferCount = GetLaunchBufferCount();
+		swapChainDesc.BufferCount = proxyBufferCount;
 		swapChainDesc.SwapEffect = a_swapChainDesc.SwapEffect;
 		// No frame-latency waitable object: DLSS-G presents from its own pacing thread and Reflex
 		// handles latency; waiting on the native swap chain's object would fight that pacer.
@@ -241,8 +238,8 @@ bool DX12SwapChain::CreateSwapChainDLSSG(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_
 
 		DX::ThrowIfFailed(swapChain1->QueryInterface(IID_PPV_ARGS(&swapChain)));
 
-		DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(swapChainBuffers[0].put())));
-		DX::ThrowIfFailed(swapChain->GetBuffer(1, IID_PPV_ARGS(swapChainBuffers[1].put())));
+		for (UINT i = 0; i < proxyBufferCount; i++)
+			DX::ThrowIfFailed(swapChain->GetBuffer(i, IID_PPV_ARGS(swapChainBuffers[i].put())));
 
 		frameIndex = swapChain->GetCurrentBackBufferIndex();
 
@@ -347,9 +344,21 @@ void DX12SwapChain::CreateInterop()
 	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(&d3d11Fence)));
 	CloseHandle(sharedFenceHandle);
 
+	HANDLE inputReadyFenceHandle;
+	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(inputReadyFence12.put())));
+	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(inputReadyFence12.get(), nullptr, GENERIC_ALL, nullptr, &inputReadyFenceHandle));
+	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(inputReadyFenceHandle, IID_PPV_ARGS(inputReadyFence11.put())));
+	CloseHandle(inputReadyFenceHandle);
+
 	swapChainProxy = new DXGISwapChainProxy(swapChain);
 
 	RecreateWrappedResources(swapChainDesc);
+
+	const bool pipelined = globals::features::upscaling.settings.frameGenerationPipelined;
+	logger::info("[DX12SwapChain] Frame-generation hand-off at startup: {} ({} swap-chain buffers, {} frame generation)",
+		pipelined ? "pipelined (3-deep D3D12 input ring, D3D11 released right after the input copy)" :
+					"serialized (D3D11 waits for the frame-generation present)",
+		proxyBufferCount, useDLSSG ? "DLSS" : "FSR");
 }
 
 void DX12SwapChain::RecreateWrappedResources(const DXGI_SWAP_CHAIN_DESC1& desc)
@@ -430,19 +439,31 @@ HRESULT DX12SwapChain::ResizeBuffers(UINT bufferCount, UINT width, UINT height, 
 	// frame-generation swap-chain stores the supplied value verbatim and uses it
 	// as its replacement-buffer count, so forwarding zero leaves it with no valid
 	// source resource at the next Present.
-	const UINT effectiveBufferCount = bufferCount ? bufferCount : swapChainDesc.BufferCount;
+	UINT effectiveBufferCount = bufferCount ? bufferCount : swapChainDesc.BufferCount;
 	if (!bufferCount)
 		logger::warn("[FidelityFX] Normalized ResizeBuffers count from 0 to {} to preserve replacement buffers", effectiveBufferCount);
-	if (effectiveBufferCount != 2) {
-		logger::error("[DX12SwapChain] Rejected unsupported resize buffer count {} (CS requires 2)", effectiveBufferCount);
-		return DXGI_ERROR_UNSUPPORTED;
+	if (effectiveBufferCount != proxyBufferCount) {
+		if (proxyBufferCount == kLegacyBufferCount) {
+			logger::error("[DX12SwapChain] Rejected unsupported resize buffer count {} (CS requires 2)", effectiveBufferCount);
+			return DXGI_ERROR_UNSUPPORTED;
+		}
+		// The game only ever sees the wrapped D3D11 buffer; keep the proxy's own count.
+		static bool countOverrideLogged = false;
+		if (!countOverrideLogged) {
+			countOverrideLogged = true;
+			logger::info("[DX12SwapChain] ResizeBuffers asked for {} buffers; keeping {} for the pipelined hand-off", effectiveBufferCount, proxyBufferCount);
+		}
+		effectiveBufferCount = proxyBufferCount;
 	}
+
+	// Nothing queued may still reference the old buffers or the input ring built from them.
+	WaitForGPUIdle();
 
 	// These references are to FidelityFX replacement buffers. They must not keep
 	// the old generation alive across the provider's resize, and must be refreshed
 	// before CS records another copy.
-	swapChainBuffers[0] = nullptr;
-	swapChainBuffers[1] = nullptr;
+	for (auto& buffer : swapChainBuffers)
+		buffer = nullptr;
 	const HRESULT result = swapChain->ResizeBuffers(effectiveBufferCount, width, height, format, flags);
 	if (FAILED(result))
 		return result;
@@ -456,13 +477,95 @@ HRESULT DX12SwapChain::ResizeBuffers(UINT bufferCount, UINT width, UINT height, 
 	                                     resizedDesc.Height != swapChainDesc.Height ||
 	                                     resizedDesc.Format != swapChainDesc.Format;
 	if (wrappedResourcesChanged)
-		RecreateWrappedResources(resizedDesc);
+		RecreateWrappedResources(resizedDesc);  // the input ring follows on the next pipelined present
 	swapChainDesc = resizedDesc;
 
-	DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(swapChainBuffers[0].put())));
-	DX::ThrowIfFailed(swapChain->GetBuffer(1, IID_PPV_ARGS(swapChainBuffers[1].put())));
+	for (UINT i = 0; i < proxyBufferCount; i++)
+		DX::ThrowIfFailed(swapChain->GetBuffer(i, IID_PPV_ARGS(swapChainBuffers[i].put())));
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
 	return S_OK;
+}
+
+void DX12SwapChain::WaitForGPUIdle()
+{
+	if (!commandQueue || !d3d12Fence)
+		return;
+	fenceValue++;
+	if (SUCCEEDED(commandQueue->Signal(d3d12Fence.get(), fenceValue)))
+		DX::ThrowIfFailed(d3d12Fence->SetEventOnCompletion(fenceValue, nullptr));
+}
+
+void DX12SwapChain::ReleaseFrameRing()
+{
+	for (auto& slot : frameRing)
+		slot = FrameRingSlot{};
+	std::fill(std::begin(frameRingSources), std::end(frameRingSources), nullptr);
+	frameRingReady = false;
+}
+
+bool DX12SwapChain::EnsureFrameRing()
+{
+	if (frameRingFailed || !d3d12Device || !swapChainBufferWrapped || !uiBufferWrapped)
+		return false;
+
+	ID3D12Resource* const sources[5] = {
+		swapChainBufferWrapped->resource.get(),
+		uiBufferWrapped->resource.get(),
+		hudlessBufferWrapped ? hudlessBufferWrapped->resource.get() : nullptr,
+		depthBufferShared12 ? depthBufferShared12->resource.get() : nullptr,
+		motionVectorBufferShared12 ? motionVectorBufferShared12->resource.get() : nullptr,
+	};
+	if (frameRingReady && std::equal(std::begin(sources), std::end(sources), std::begin(frameRingSources)))
+		return true;
+
+	// First use, or the shared inputs were recreated (resize, shared depth/motion created later):
+	// nothing queued may still read the old slots.
+	WaitForGPUIdle();
+	ReleaseFrameRing();
+
+	try {
+		const auto makeTwin = [&](ID3D12Resource* source, const wchar_t* name, UINT slot) {
+			winrt::com_ptr<ID3D12Resource> twin;
+			if (!source)
+				return twin;
+			D3D12_RESOURCE_DESC desc = source->GetDesc();
+			desc.Alignment = 0;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+			const CD3DX12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+			DX::ThrowIfFailed(d3d12Device->CreateCommittedResource(&heapProperties, D3D12_HEAP_FLAG_NONE, &desc,
+				D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(twin.put())));
+			twin->SetName(std::format(L"CS FG input ring {} {}", name, slot).c_str());
+			return twin;
+		};
+
+		for (UINT slot = 0; slot < kFrameRingSize; slot++) {
+			auto& ring = frameRing[slot];
+			ring.scene = makeTwin(sources[0], L"scene", slot);
+			ring.ui = makeTwin(sources[1], L"UI", slot);
+			ring.hudless = makeTwin(sources[2], L"HUD-less", slot);
+			ring.depth = makeTwin(sources[3], L"depth", slot);
+			ring.motionVectors = makeTwin(sources[4], L"motion vectors", slot);
+
+			if (!ringCopyAllocators[slot]) {
+				DX::ThrowIfFailed(d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(ringCopyAllocators[slot].put())));
+				DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ringCopyAllocators[slot].get(), nullptr, IID_PPV_ARGS(ringCopyLists[slot].put())));
+				DX::ThrowIfFailed(ringCopyLists[slot]->Close());
+			}
+		}
+	} catch (const std::exception& e) {
+		logger::error("[DX12SwapChain] Could not create the frame-generation input ring ({}); falling back to the serialized hand-off", e.what());
+		ReleaseFrameRing();
+		frameRingFailed = true;
+		return false;
+	}
+
+	std::copy(std::begin(sources), std::end(sources), std::begin(frameRingSources));
+	frameRingReady = true;
+	logger::info("[DX12SwapChain] Frame-generation input ring ready: {} slots of {}x{} (scene, UI{}{})",
+		kFrameRingSize, swapChainDesc.Width, swapChainDesc.Height,
+		sources[2] ? ", HUD-less" : "", (sources[3] && sources[4]) ? ", depth, motion vectors" : "");
+	return true;
 }
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
@@ -490,10 +593,94 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		dlssgUISeparated = ComposeUIForDLSSG();
 	uiRoutedForFGComposite = false;
 
-	// Wait for D3D11 to finish (includes ApplyHDR scene encoding AND UIBrightnessCS)
-	fenceValue++;
-	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
-	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
+	// Pipelined hand-off (Upscaling.frameGenerationPipelined, switchable live): copy this frame's
+	// D3D11 inputs into a private ring slot and release D3D11 right after that copy, instead of
+	// after the frame-generation present (which waits on the presentation of the previous frame).
+	const bool pipelined = upscaling.settings.frameGenerationPipelined && EnsureFrameRing();
+	if (static_cast<int>(pipelined) != loggedHandOffMode) {
+		logger::info("[DX12SwapChain] Frame-generation hand-off: {} ({} swap-chain buffers)",
+			pipelined ? "pipelined, D3D11 released after the input copy" : "serialized, D3D11 waits for the frame-generation present",
+			proxyBufferCount);
+		loggedHandOffMode = static_cast<int>(pipelined);
+	}
+
+	// D3D11 -> D3D12: the D3D12 queue waits until D3D11 has written this frame's inputs
+	// (includes ApplyHDR scene encoding AND UIBrightnessCS)
+	inputReadyValue++;
+	DX::ThrowIfFailed(d3d11Context->Signal(inputReadyFence11.get(), inputReadyValue));
+	DX::ThrowIfFailed(commandQueue->Wait(inputReadyFence12.get(), inputReadyValue));
+
+	// What frame generation reads this frame: the shared D3D11 textures (serialized) or the ring slot.
+	ID3D12Resource* sceneInput = swapChainBufferWrapped->resource.get();
+	ID3D12Resource* uiInput = uiBufferWrapped->resource.get();
+	ID3D12Resource* hudlessInput = hudlessBufferWrapped ? hudlessBufferWrapped->resource.get() : nullptr;
+	ID3D12Resource* depthInput = depthBufferShared12 ? depthBufferShared12->resource.get() : nullptr;
+	ID3D12Resource* motionVectorInput = motionVectorBufferShared12 ? motionVectorBufferShared12->resource.get() : nullptr;
+
+	if (pipelined) {
+		const UINT slot = static_cast<UINT>(presentCounter % kFrameRingSize);
+		auto& ring = frameRing[slot];
+
+		// The slot's copy list was last submitted kFrameRingSize frames ago.
+		if (ringCopyFenceValues[slot])
+			DX::ThrowIfFailed(d3d12Fence->SetEventOnCompletion(ringCopyFenceValues[slot], nullptr));
+		DX::ThrowIfFailed(ringCopyAllocators[slot]->Reset());
+		auto* copyList = ringCopyLists[slot].get();
+		DX::ThrowIfFailed(copyList->Reset(ringCopyAllocators[slot].get(), nullptr));
+
+		// Only copy what is consumed this frame: depth/motion/UI are written (and read) on frame
+		// generation frames only, the HUD-less copy only when the DLSS-G UI composite ran.
+		struct InputCopy
+		{
+			ID3D12Resource* source;
+			ID3D12Resource* destination;
+		};
+		InputCopy copies[5]{};
+		UINT copyCount = 0;
+		const auto addCopy = [&](ID3D12Resource* source, ID3D12Resource* destination) {
+			if (source && destination)
+				copies[copyCount++] = { source, destination };
+		};
+		addCopy(sceneInput, ring.scene.get());
+		if (useFrameGeneration) {
+			addCopy(uiInput, ring.ui.get());
+			addCopy(depthInput, ring.depth.get());
+			addCopy(motionVectorInput, ring.motionVectors.get());
+		}
+		if (dlssgUISeparated)
+			addCopy(hudlessInput, ring.hudless.get());
+
+		D3D12_RESOURCE_BARRIER barriers[10]{};
+		for (UINT i = 0; i < copyCount; i++) {
+			barriers[2 * i] = CD3DX12_RESOURCE_BARRIER::Transition(copies[i].source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			barriers[2 * i + 1] = CD3DX12_RESOURCE_BARRIER::Transition(copies[i].destination, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+		}
+		copyList->ResourceBarrier(2 * copyCount, barriers);
+		for (UINT i = 0; i < copyCount; i++)
+			copyList->CopyResource(copies[i].destination, copies[i].source);
+		for (UINT i = 0; i < copyCount; i++) {
+			barriers[2 * i] = CD3DX12_RESOURCE_BARRIER::Transition(copies[i].source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+			barriers[2 * i + 1] = CD3DX12_RESOURCE_BARRIER::Transition(copies[i].destination, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+		}
+		copyList->ResourceBarrier(2 * copyCount, barriers);
+		DX::ThrowIfFailed(copyList->Close());
+
+		ID3D12CommandList* copyLists[] = { copyList };
+		commandQueue->ExecuteCommandLists(1, copyLists);
+
+		// D3D11 may overwrite the shared inputs as soon as the copies have executed; it no longer
+		// waits for the frame-generation present of this frame.
+		fenceValue++;
+		DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
+		ringCopyFenceValues[slot] = fenceValue;
+		DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
+
+		sceneInput = ring.scene.get();
+		uiInput = ring.ui.get();
+		hudlessInput = ring.hudless.get();
+		depthInput = ring.depth.get();
+		motionVectorInput = ring.motionVectors.get();
+	}
 
 	// New frame, reset
 	if (frameFenceValues[frameIndex])
@@ -501,9 +688,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	DX::ThrowIfFailed(commandAllocators[frameIndex]->Reset());
 	DX::ThrowIfFailed(commandLists[frameIndex]->Reset(commandAllocators[frameIndex].get(), nullptr));
 
-	// Copy shared texture to swap chain buffer
+	// Copy the frame to the swap chain buffer
 	{
-		auto fakeSwapChain = swapChainBufferWrapped->resource.get();
+		auto fakeSwapChain = sceneInput;
 		auto realSwapChain = swapChainBuffers[frameIndex].get();
 		{
 			std::vector<D3D12_RESOURCE_BARRIER> barriers;
@@ -528,7 +715,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	if (useDLSSG) {
 		auto& slDX12 = upscaling.streamlineDX12;
-		const bool dlssgEnabled = useFrameGeneration && slDX12.featureDLSSG && depthBufferShared12 && motionVectorBufferShared12;
+		const bool dlssgEnabled = useFrameGeneration && slDX12.featureDLSSG && depthInput && motionVectorInput;
 
 		if (auto* token = slDX12.GetFrameToken(presentFrameIndex)) {
 			slDX12.SetFrameConstants(*token, slDX12.viewport);
@@ -544,20 +731,24 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 				const sl::Extent backbufferExtent{ 0, 0, swapChainDesc.Width, swapChainDesc.Height };
 
 				slDX12.TagDLSSGResources(*token, commandLists[frameIndex].get(),
-					depthBufferShared12->resource.get(),
-					motionVectorBufferShared12->resource.get(),
+					depthInput,
+					motionVectorInput,
 					renderExtent,
-					dlssgUISeparated ? hudlessBufferWrapped->resource.get() : nullptr,
-					dlssgUISeparated ? uiBufferWrapped->resource.get() : nullptr,
+					dlssgUISeparated ? hudlessInput : nullptr,
+					dlssgUISeparated ? uiInput : nullptr,
 					backbufferExtent);
 			}
 		}
 
 		// Keep DLSS-G's resources while frame generation is only paused (menus); release them when
 		// frame generation is switched off in the settings.
-		slDX12.ConfigureDLSSG(dlssgEnabled, upscaling.settings.frameGenerationMode != 0, upscaling.settings.dlssgFramesToGenerate);
+		const auto& settings = upscaling.settings;
+		slDX12.ConfigureDLSSG(dlssgEnabled, settings.frameGenerationMode != 0, settings.dlssgFramesToGenerate,
+			settings.dlssgDynamic, settings.dlssgDynamicTargetFps, settings.dlssgUIRecomposition && CanSeparateUIForDLSSG());
 	} else {
-		upscaling.fidelityFX.Present(useFrameGeneration, isHDR);
+		const auto& settings = upscaling.settings;
+		upscaling.fidelityFX.ApplyFramePacingTuning(settings.fsrFGPacingSafetyMarginMs, settings.fsrFGPacingVarianceFactor);
+		upscaling.fidelityFX.Present(useFrameGeneration, isHDR, depthInput, motionVectorInput, uiInput);
 	}
 
 	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
@@ -580,14 +771,17 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	DX::ThrowIfFailed(presentResult);
 
-	// Wait for D3D12 to finish
+	// Everything queued for this frame, including the frame-generation present work
 	fenceValue++;
 	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
 	frameFenceValues[frameIndex] = fenceValue;
-	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
+	// Serialized hand-off: D3D11 waits for the frame-generation present of this frame.
+	if (!pipelined)
+		DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
 
 	// Update the frame index
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
+	presentCounter++;
 
 	float clearColor[4]{ 0, 0, 0, 0 };
 	d3d11Context->ClearRenderTargetView(uiBufferWrapped->rtv, clearColor);

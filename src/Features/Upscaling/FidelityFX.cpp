@@ -71,10 +71,35 @@ void FidelityFX::SetupFrameGeneration()
  *
  * @param a_useFrameGeneration If true, enables frame generation and dispatches the necessary workloads; otherwise, presents without frame generation.
  */
-void FidelityFX::Present(bool a_useFrameGeneration, bool a_isHDR)
+void FidelityFX::ApplyFramePacingTuning(float a_safetyMarginMs, float a_varianceFactor)
+{
+	if (!swapChainContext)
+		return;
+	if (framePacingTuningApplied && framePacingTuning.safetyMarginInMs == a_safetyMarginMs && framePacingTuning.varianceFactor == a_varianceFactor)
+		return;
+
+	framePacingTuning = { a_safetyMarginMs, a_varianceFactor, true, 2, true };
+	framePacingTuningApplied = true;
+
+	ffx::ConfigureDescFrameGenerationSwapChainKeyValueDX12 pacingConfig{};
+	pacingConfig.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING;
+	pacingConfig.u64 = 0;
+	pacingConfig.ptr = &framePacingTuning;
+	if (ffx::Configure(swapChainContext, pacingConfig) != ffx::ReturnCode::Ok)
+		logger::warn("[FidelityFX] Failed to apply frame pacing tuning (safetyMargin={}ms variance={})", a_safetyMarginMs, a_varianceFactor);
+	else
+		logger::info("[FidelityFX] Frame pacing tuning applied: safetyMargin={}ms variance={} hybridSpin={} spinTime={} waitOnFence={}",
+			framePacingTuning.safetyMarginInMs, framePacingTuning.varianceFactor, framePacingTuning.allowHybridSpin,
+			framePacingTuning.hybridSpinTime, framePacingTuning.allowWaitForSingleObjectOnFence);
+}
+
+void FidelityFX::Present(bool a_useFrameGeneration, bool a_isHDR, ID3D12Resource* a_depth, ID3D12Resource* a_motionVectors, ID3D12Resource* a_ui)
 {
 	auto& upscaling = globals::features::upscaling;
 	auto& swapChain = globals::features::upscaling.dx12SwapChain;
+
+	// Frame generation needs this frame's depth, motion vectors and UI on the D3D12 device.
+	a_useFrameGeneration = a_useFrameGeneration && a_depth && a_motionVectors && a_ui;
 
 	// Cache peak nits first since we need HDR feature access
 	auto* hdr = globals::features::hdrDisplay.loaded ? &globals::features::hdrDisplay : nullptr;
@@ -167,7 +192,7 @@ void FidelityFX::Present(bool a_useFrameGeneration, bool a_isHDR)
 	// When paused, UI is composited in HDROutputCS to avoid flickering from inconsistent FidelityFX compositing
 	ffx::ConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiConfig{};
 	if (a_useFrameGeneration) {
-		uiConfig.uiResource = ffxApiGetResourceDX12(swapChain.uiBufferWrapped->resource.get());
+		uiConfig.uiResource = ffxApiGetResourceDX12(a_ui);
 		// Use both premultiplied alpha and double buffering for consistent blending
 		uiConfig.flags = FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA |
 		                 FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING;
@@ -204,8 +229,8 @@ void FidelityFX::Present(bool a_useFrameGeneration, bool a_isHDR)
 
 		dispatchParameters.frameID = frameID;
 
-		dispatchParameters.depth = ffxApiGetResourceDX12(swapChain.depthBufferShared12->resource.get());
-		dispatchParameters.motionVectors = ffxApiGetResourceDX12(swapChain.motionVectorBufferShared12->resource.get());
+		dispatchParameters.depth = ffxApiGetResourceDX12(a_depth);
+		dispatchParameters.motionVectors = ffxApiGetResourceDX12(a_motionVectors);
 
 		ffx::DispatchDescFrameGenerationPrepareCameraInfo cameraConfig{};
 
