@@ -1,0 +1,46 @@
+name: "Nordic: Build Plugin"
+
+# Fork-only build for the nordic-perf branch: builds the plugin + AIO package
+# with the shared build workflow and uploads dist/ as the `dist-artifacts`
+# artifact. No release, upload or notification steps, so no secrets are needed.
+
+on:
+    push:
+        branches:
+            - nordic-perf
+    workflow_dispatch:
+        inputs:
+            cmake-preset:
+                description: "CMake preset (ALL = shipping LTCG + full PDB, PR = /O2 without LTCG, faster)"
+                type: choice
+                options:
+                    - ALL
+                    - PR
+                default: ALL
+            validate-shaders:
+                description: "Also run HLSL shader validation"
+                type: boolean
+                default: false
+            cache-key-suffix:
+                description: "Optional suffix to invalidate the build cache"
+                type: string
+                default: ""
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+    cancel-in-progress: false
+
+jobs:
+    build:
+        name: Build
+        uses: ./.github/workflows/_shared-build.yaml
+        with:
+            ref: ${{ github.sha }}
+            repository: ${{ github.repository }}
+            run-cpp: true
+            run-shader-validation: ${{ github.event_name == 'workflow_dispatch' && inputs.validate-shaders == true }}
+            cmake-preset: ${{ inputs.cmake-preset || 'ALL' }}
+            cache-key-suffix: ${{ inputs.cache-key-suffix || '' }}
