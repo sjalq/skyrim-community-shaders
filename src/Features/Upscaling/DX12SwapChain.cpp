@@ -81,6 +81,22 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 
 	if (ffx::CreateContext(fidelityFX.swapChainContext, nullptr, ffxSwapChainDesc) != ffx::ReturnCode::Ok) {
 		logger::critical("[FidelityFX] Failed to create swap chain context!");
+	} else {
+		// The default pacing tuning busy-spins the FG present/pacing threads and spin-waits on
+		// fences, burning up to a full CPU core each. Allow hybrid spin (sleep, then spin for the
+		// last 2 timer-resolution units) and WaitForSingleObject on fences instead. Safety margin
+		// and variance factor stay at the FidelityFX defaults (0.1 ms / 0.1).
+		static FfxApiSwapchainFramePacingTuning framePacingTuning{ 0.1f, 0.1f, true, 2, true };
+		ffx::ConfigureDescFrameGenerationSwapChainKeyValueDX12 pacingConfig{};
+		pacingConfig.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING;
+		pacingConfig.u64 = 0;
+		pacingConfig.ptr = &framePacingTuning;
+		if (ffx::Configure(fidelityFX.swapChainContext, pacingConfig) != ffx::ReturnCode::Ok)
+			logger::warn("[FidelityFX] Failed to apply frame pacing tuning (hybrid spin / fence wait)");
+		else
+			logger::info("[FidelityFX] Frame pacing tuning applied: safetyMargin={}ms variance={} hybridSpin={} spinTime={} waitOnFence={}",
+				framePacingTuning.safetyMarginInMs, framePacingTuning.varianceFactor, framePacingTuning.allowHybridSpin,
+				framePacingTuning.hybridSpinTime, framePacingTuning.allowWaitForSingleObjectOnFence);
 	}
 
 	DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(&swapChainBuffers[0])));
