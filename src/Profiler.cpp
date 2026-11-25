@@ -31,6 +31,29 @@ float Profiler::RollingHistory::GetPercentile(float p) const
 	return sorted[lo] * (1.0f - frac) + sorted[hi] * frac;
 }
 
+void Profiler::RollingHistory::GetPercentiles(float pA, float pB, float& outA, float& outB) const
+{
+	if (count == 0) {
+		outA = lastMs;
+		outB = lastMs;
+		return;
+	}
+
+	thread_local std::vector<float> sorted;
+	sorted.assign(history, history + count);
+	std::sort(sorted.begin(), sorted.end());
+
+	const auto at = [this](float p) {
+		float idx = (p / 100.0f) * static_cast<float>(count - 1);
+		uint32_t lo = static_cast<uint32_t>(idx);
+		uint32_t hi = std::min(lo + 1, count - 1);
+		float frac = idx - static_cast<float>(lo);
+		return sorted[lo] * (1.0f - frac) + sorted[hi] * frac;
+	};
+	outA = at(pA);
+	outB = at(pB);
+}
+
 void Profiler::Initialize(ID3D11Device* device, ID3D11DeviceContext* a_context)
 {
 	Release();
@@ -72,6 +95,7 @@ void Profiler::Release()
 		frame.inFlight = false;
 	}
 	results.clear();
+	resultsDirty = false;
 	knownTimers.clear();
 	knownTimerIndex.clear();
 	collectedFrames = 0;
@@ -167,12 +191,6 @@ void Profiler::CollectResults()
 	frame.inFlight = false;
 	collectedFrames++;
 
-	struct ActiveTimerData
-	{
-		float gpuMs = 0.0f;
-		float cpuMs = 0.0f;
-	};
-	std::unordered_map<std::string, ActiveTimerData> activeTimers;
 	float activeTotalMs = 0.0f;
 	float activeCpuTotalMs = 0.0f;
 
@@ -189,9 +207,6 @@ void Profiler::CollectResults()
 				continue;
 
 			float ms = static_cast<float>(static_cast<double>(tsEnd - tsBegin) * ticksToMs);
-			auto& entry = activeTimers[timer.name];
-			entry.gpuMs += ms;
-			entry.cpuMs += timer.cpuMs;
 			activeTotalMs += ms;
 			activeCpuTotalMs += timer.cpuMs;
 
@@ -202,6 +217,14 @@ void Profiler::CollectResults()
 				knownTimers.push_back(std::move(kt));
 			}
 			auto& known = knownTimers[it->second];
+			// First sample of this pass in this collected frame: restart the per-frame sums.
+			// (Same aggregation the old per-frame activeTimers map did for repeated passes.)
+			if (known.lastSampleFrame != collectedFrames) {
+				known.frameGpuMs = 0.0f;
+				known.frameCpuMs = 0.0f;
+			}
+			known.frameGpuMs += ms;
+			known.frameCpuMs += timer.cpuMs;
 			known.gpu.PushSample(ms);
 			known.cpu.PushSample(timer.cpuMs);
 			known.lastSampleFrame = collectedFrames;
@@ -213,25 +236,30 @@ void Profiler::CollectResults()
 	totalTimeMs = activeTotalMs;
 	cpuTotalTimeMs = activeCpuTotalMs;
 
+	// Per-pass results and their percentiles are only read by the profiler UI and the
+	// devbench bridge; build them on demand in GetResults() instead of every frame.
+	resultsDirty = true;
+}
+
+void Profiler::RebuildResults() const
+{
+	resultsDirty = false;
 	results.clear();
 	results.reserve(knownTimers.size());
 	for (const auto& known : knownTimers) {
 		TimerResult result;
 		result.name = known.name;
-		auto it = activeTimers.find(known.name);
-		if (it != activeTimers.end()) {
-			result.gpuTimeMs = it->second.gpuMs;
-			result.cpuTimeMs = it->second.cpuMs;
+		if (known.lastSampleFrame == collectedFrames) {
+			result.gpuTimeMs = known.frameGpuMs;
+			result.cpuTimeMs = known.frameCpuMs;
 		} else {
 			result.gpuTimeMs = known.gpu.lastMs;
 			result.cpuTimeMs = known.cpu.lastMs;
 		}
 		result.avgMs = known.gpu.GetAverage();
-		result.p95Ms = known.gpu.GetPercentile(95.0f);
-		result.p99Ms = known.gpu.GetPercentile(99.0f);
+		known.gpu.GetPercentiles(95.0f, 99.0f, result.p95Ms, result.p99Ms);
 		result.cpuAvgMs = known.cpu.GetAverage();
-		result.cpuP95Ms = known.cpu.GetPercentile(95.0f);
-		result.cpuP99Ms = known.cpu.GetPercentile(99.0f);
+		known.cpu.GetPercentiles(95.0f, 99.0f, result.cpuP95Ms, result.cpuP99Ms);
 		result.valid = true;
 		result.historyBuffer = known.gpu.history;
 		result.historyHead = known.gpu.head;

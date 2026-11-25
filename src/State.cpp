@@ -84,7 +84,11 @@ void State::Draw()
 		// Process deferred cell transitions (interior detection)
 		sceneSettingsManager->Update();
 
-		if (csEditor.loaded) {
+		// Sky/weather state only changes in Sky::Update (game update, before rendering) and
+		// UpdateFeatures() records lastKnownWeather after acting, so every call after the
+		// first draw of a frame is a no-op. Run it once per frame instead of once per draw.
+		if (csEditor.loaded && weatherUpdateFrame != frameCount) {
+			weatherUpdateFrame = frameCount;
 			ZoneScopedN("WeatherManager::UpdateFeatures");
 			weatherManager->UpdateFeatures();
 		}

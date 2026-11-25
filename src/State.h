@@ -371,6 +371,8 @@ public:
 
 	Util::FrameChecker frameChecker;
 	uint frameCount = 0;
+	// frameCount value at which State::Draw last ran WeatherManager::UpdateFeatures.
+	uint weatherUpdateFrame = UINT_MAX;
 	// Thread-safe mirror of frameCount maintained by the render thread.
 	// Off-thread readers (MCP listener, future telemetry) must read this
 	// instead of touching frameCount directly to avoid a data race.

@@ -51,6 +51,14 @@ public:
 		 * @param p Percentile in [0, 100].
 		 */
 		float GetPercentile(float p) const;
+
+		/**
+		 * @brief Gets two interpolated percentiles with a single sort.
+		 *
+		 * Same interpolation as GetPercentile, so results are bit-identical; it only
+		 * halves the sorting work when both p95 and p99 are wanted.
+		 */
+		void GetPercentiles(float pA, float pB, float& outA, float& outB) const;
 	};
 
 	/** @brief Snapshot of GPU/CPU timing data for a single named pass. */
@@ -119,8 +127,20 @@ public:
 	/** @brief Ends the current profiling frame and advances the ring buffer write cursor. */
 	void EndFrame();
 
-	/** @brief Gets the per-pass timing results from the last collected frame. */
-	const std::vector<TimerResult>& GetResults() const { return results; }
+	/**
+	 * @brief Gets the per-pass timing results from the last collected frame.
+	 *
+	 * Results (including the sort-based p95/p99) are built lazily on first access after
+	 * each collected frame. Only the profiler UI and the devbench bridge read them, both
+	 * on the main thread, so frames where nobody looks no longer pay for ~4 sorts of up
+	 * to kHistorySize floats per timer.
+	 */
+	const std::vector<TimerResult>& GetResults() const
+	{
+		if (resultsDirty)
+			RebuildResults();
+		return results;
+	}
 
 	/** @brief Gets the total GPU time in milliseconds for the last collected frame. */
 	float GetTotalTimeMs() const { return totalTimeMs; }
@@ -132,6 +152,7 @@ public:
 	void ClearTimers()
 	{
 		results.clear();
+		resultsDirty = false;
 		knownTimers.clear();
 		knownTimerIndex.clear();
 		collectedFrames = 0;
@@ -150,6 +171,7 @@ public:
 			return kt.name.starts_with(prefix);
 		});
 		RebuildTimerIndex();
+		resultsDirty = true;  // results hold pointers into knownTimers; rebuild on next read
 	}
 
 private:
@@ -182,7 +204,9 @@ private:
 	PerfEventCallback beginPerfEvent;
 	PerfEventCallback endPerfEvent;
 
-	std::vector<TimerResult> results;
+	// Built lazily by GetResults(); mutable because building is a cache fill, not a state change.
+	mutable std::vector<TimerResult> results;
+	mutable bool resultsDirty = false;
 
 	struct KnownTimer
 	{
@@ -190,6 +214,10 @@ private:
 		RollingHistory gpu;
 		RollingHistory cpu;
 		uint64_t lastSampleFrame = 0;
+		// Per-frame sums for passes that run several times per frame (replaces the
+		// per-frame std::unordered_map<std::string, ActiveTimerData> in CollectResults).
+		float frameGpuMs = 0.0f;
+		float frameCpuMs = 0.0f;
 	};
 	std::vector<KnownTimer> knownTimers;
 	std::unordered_map<std::string, size_t> knownTimerIndex;
@@ -198,6 +226,9 @@ private:
 	float cpuTotalTimeMs = 0.0f;
 
 	void CollectResults();
+
+	/** @brief Rebuilds `results` (names, per-frame sums, averages, percentiles) from knownTimers. */
+	void RebuildResults() const;
 
 	/** @brief Drops timers that have not been sampled for kTimerRetireFrames, so disabled passes stop reporting stale values. */
 	void RetireStaleTimers();

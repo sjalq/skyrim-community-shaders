@@ -1887,8 +1887,10 @@ namespace SIE
 			// Track this shader as active
 			TrackActiveShader(ShaderClass::Vertex, shader, descriptor);
 
-			auto key = SIE::SShaderCache::GetShaderString(ShaderClass::Vertex, shader, descriptor, true);
-			if (blockedKeyIndex != -1 && !blockedKey.empty() && key == blockedKey) {
+			// Only build the (fmt + sorted-defines) key when a shader block is actually active;
+			// the comparison result is identical, the per-lookup string work is not.
+			if (blockedKeyIndex != -1 && !blockedKey.empty() &&
+				SIE::SShaderCache::GetShaderString(ShaderClass::Vertex, shader, descriptor, true) == blockedKey) {
 				if (std::find(blockedIDs.begin(), blockedIDs.end(), descriptor) == blockedIDs.end()) {
 					blockedIDs.push_back(descriptor);
 					logger::debug("Skipping blocked shader {:X}:{} total: {}", descriptor, blockedKey, blockedIDs.size());
@@ -1932,8 +1934,10 @@ namespace SIE
 			// Track this shader as active
 			TrackActiveShader(ShaderClass::Pixel, shader, descriptor);
 
-			auto key = SIE::SShaderCache::GetShaderString(ShaderClass::Pixel, shader, descriptor, true);
-			if (blockedKeyIndex != -1 && !blockedKey.empty() && key == blockedKey) {
+			// Only build the (fmt + sorted-defines) key when a shader block is actually active;
+			// the comparison result is identical, the per-lookup string work is not.
+			if (blockedKeyIndex != -1 && !blockedKey.empty() &&
+				SIE::SShaderCache::GetShaderString(ShaderClass::Pixel, shader, descriptor, true) == blockedKey) {
 				if (std::find(blockedIDs.begin(), blockedIDs.end(), descriptor) == blockedIDs.end()) {
 					blockedIDs.push_back(descriptor);
 					logger::debug("Skipping blocked shader {:X}:{} total: {}", descriptor, blockedKey, blockedIDs.size());
@@ -1976,8 +1980,10 @@ namespace SIE
 			// Track this shader as active
 			TrackActiveShader(ShaderClass::Compute, shader, descriptor);
 
-			auto key = SIE::SShaderCache::GetShaderString(ShaderClass::Compute, shader, descriptor, true);
-			if (blockedKeyIndex != -1 && !blockedKey.empty() && key == blockedKey) {
+			// Only build the (fmt + sorted-defines) key when a shader block is actually active;
+			// the comparison result is identical, the per-lookup string work is not.
+			if (blockedKeyIndex != -1 && !blockedKey.empty() &&
+				SIE::SShaderCache::GetShaderString(ShaderClass::Compute, shader, descriptor, true) == blockedKey) {
 				if (std::find(blockedIDs.begin(), blockedIDs.end(), descriptor) == blockedIDs.end()) {
 					blockedIDs.push_back(descriptor);
 					logger::debug("Skipping blocked shader {:X}:{} total: {}", descriptor, blockedKey, blockedIDs.size());
