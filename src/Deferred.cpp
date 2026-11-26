@@ -691,7 +691,7 @@ void Deferred::Hooks::Main_RenderWorld_BlendedDecals::thunk(RE::BSShaderAccumula
 	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 	auto depthCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 
-	context->CopyResource(depthCopy.texture, depth.texture);
+	Util::CopyDynamicTexture(context, depthCopy.texture, depth.texture, true);
 
 	// After this point, water starts rendering
 };

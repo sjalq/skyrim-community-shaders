@@ -1,11 +1,14 @@
 #include "D3D.h"
 
+#include "ConstantBufferRing.h"
 #include "Features/TerrainBlending.h"
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/Format.h"
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
+#include <algorithm>
+#include <cmath>
 #include <d3dcompiler.h>
 #include <mutex>
 
@@ -530,5 +533,36 @@ namespace Util
 		}
 
 		return S_OK;
+	}
+
+	void CopyDynamicTexture(ID3D11DeviceContext* a_context, ID3D11Resource* a_dst, ID3D11Resource* a_src, bool a_isDepth)
+	{
+		if (!a_context || !a_dst || !a_src || a_dst == a_src)
+			return;
+		if (auto* viewport = globals::game::graphicsState; viewport && (!a_isDepth || ConstantBufferRing::IsDXVK())) {
+			const auto& rt = viewport->GetRuntimeData();
+			const float rx = rt.dynamicResolutionWidthRatio;
+			const float ry = rt.dynamicResolutionHeightRatio;
+			if (rx > 0.0f && ry > 0.0f && (rx < 0.995f || ry < 0.995f)) {
+				D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+				a_src->GetType(&dim);
+				if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+					D3D11_TEXTURE2D_DESC desc{};
+					static_cast<ID3D11Texture2D*>(a_src)->GetDesc(&desc);
+					if (desc.MipLevels == 1 && desc.ArraySize == 1 && desc.SampleDesc.Count <= 1 && desc.Width > 0 && desc.Height > 0) {
+						D3D11_BOX box{};
+						box.left = 0;
+						box.top = 0;
+						box.front = 0;
+						box.right = std::min(desc.Width, static_cast<UINT>(std::ceil(static_cast<float>(desc.Width) * rx)) + 4u);
+						box.bottom = std::min(desc.Height, static_cast<UINT>(std::ceil(static_cast<float>(desc.Height) * ry)) + 4u);
+						box.back = 1;
+						a_context->CopySubresourceRegion(a_dst, 0, 0, 0, 0, a_src, 0, &box);
+						return;
+					}
+				}
+			}
+		}
+		a_context->CopyResource(a_dst, a_src);
 	}
 }  // namespace Util

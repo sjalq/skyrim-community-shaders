@@ -247,24 +247,24 @@ RE::NiColor LinearLighting::ColorToLinear(RE::NiColor inColor, float gamma)
 
 void LinearLighting::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 {
+	if (!settings.enableLinearLighting)
+		return;
+
 	auto& property1 = a_pass->geometry->GetGeometryRuntimeData().shaderProperty;
 	auto lightProperty = property1 && property1->GetRTTI() == globals::rtti::BSLightingShaderPropertyRTTI.get() ? static_cast<RE::BSLightingShaderProperty*>(property1.get()) : nullptr;
 
 	if (lightProperty != nullptr) {
-		float emissiveMult = 1.0f;
-		if (settings.enableLinearLighting) {
-			emissiveMult = lightProperty->emissiveMult;
-			PerGeometryData perGeometryData{};
-			perGeometryData.emissiveMult = emissiveMult;
-			// Every lighting draw, so through the constant buffer ring while it is active: unchanged contents
-			// reuse their ring range instead of costing a DXVK buffer rename each.
-			if (!ConstantBufferRing::PublishOwned(PerGeometryCB->CB(), &perGeometryData, sizeof(perGeometryData)))
-				PerGeometryCB->Update(perGeometryData);
+		float emissiveMult = lightProperty->emissiveMult;
+		PerGeometryData perGeometryData{};
+		perGeometryData.emissiveMult = emissiveMult;
+		// Every lighting draw, so through the constant buffer ring while it is active: unchanged contents
+		// reuse their ring range instead of costing a DXVK buffer rename each.
+		if (!ConstantBufferRing::PublishOwned(PerGeometryCB->CB(), &perGeometryData, sizeof(perGeometryData)))
+			PerGeometryCB->Update(perGeometryData);
 
-			ID3D11Buffer* buffer = { PerGeometryCB->CB() };
-			auto context = globals::d3d::context;
-			context->PSSetConstantBuffers(8, 1, &buffer);
-		}
+		ID3D11Buffer* buffer = { PerGeometryCB->CB() };
+		auto context = globals::d3d::context;
+		context->PSSetConstantBuffers(8, 1, &buffer);
 	}
 }
 

@@ -230,7 +230,7 @@ void TerrainBlending::BlendPrepassDepths()
 	auto renderer = globals::game::renderer;
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 
-	context->CopyResource(terrainDepth.texture, mainDepth.texture);
+	Util::CopyDynamicTexture(context, terrainDepth.texture, mainDepth.texture, true);
 
 	if (globals::state->frameAnnotations)
 		globals::state->EndPerfEvent();

@@ -1771,10 +1771,10 @@ void Upscaling::UpscaleDepth()
 	auto bufferArray = jitterCB->CB();
 	context->PSSetConstantBuffers(0, 1, &bufferArray);
 
-	// (3) Skip aliased copies
-	const auto copyIfNonAliased = [&](ID3D11Resource* dst, ID3D11Resource* src) {
+	// (3) Skip aliased copies; under dynamic resolution copy only the active top-left region.
+	const auto copyIfNonAliased = [&](ID3D11Resource* dst, ID3D11Resource* src, bool isDepth = false) {
 		if (dst && src && dst != src) {
-			context->CopyResource(dst, src);
+			Util::CopyDynamicTexture(context, dst, src, isDepth);
 		}
 	};
 
@@ -1783,7 +1783,7 @@ void Upscaling::UpscaleDepth()
 
 		// Sometimes this is not already copied e.g. map menu.
 		// Skip alias copies to reduce unnecessary copy churn.
-		copyIfNonAliased(depthCopy.texture, depth.texture);
+		copyIfNonAliased(depthCopy.texture, depth.texture, true);
 
 		// Set depth stencil state to write 0x00
 		context->OMSetDepthStencilState(upscaleDepthStencilState.get(), 0x00);

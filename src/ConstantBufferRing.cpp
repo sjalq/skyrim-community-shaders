@@ -57,9 +57,7 @@ namespace ConstantBufferRing
 		{
 			ID3D11Buffer* buffer = nullptr;         // one reference is held so the address cannot be reused
 			std::unique_ptr<ShadowBlock[]> shadow;  // latest contents; the engine writes here between Map and Unmap
-			// byteWidth bytes of the latest upload, to skip unchanged ones. While the buffer is not mapped it
-			// equals the shadow (the latest contents): every Unmap either matches it or uploads, which copies
-			// the shadow here.
+			// byteWidth bytes of the latest upload when the ring cannot be read cheaply (WC VRAM / non-DXVK).
 			std::unique_ptr<ShadowBlock[]> lastUpload;
 			UINT byteWidth = 0;
 			UINT allocBytes = 0;                             // byteWidth rounded up to kAlignmentBytes
@@ -67,8 +65,14 @@ namespace ConstantBufferRing
 			UINT firstConstant = 0;                          // ring offset of the latest upload, in constants
 			uint32_t generation = 0;                         // ring generation of that upload; 0 = never uploaded
 			std::array<uint16_t, kStageCount> boundSlots{};  // slots that logically hold this buffer
+			uint32_t changeStreak = 0;                       // consecutive changed uploads; >= 16 enables direct ring writes
+			uint32_t directUses = 0;                         // periodic shadow probe counter for direct-write buffers
+			UINT directOffset = 0;                           // reserved ring byte offset while directMapped is true
+			std::byte* directPtr = nullptr;                  // pointer returned to engine while directMapped is true
 			bool mapped = false;
-			bool owned = false;  // taken over by PublishOwned rather than by an engine map
+			bool directMapped = false;  // engine is writing directly into ringData at directOffset
+			bool shadowStale = false;   // latest bytes live in ringData rather than shadow; synced lazily on wrap/deactivate
+			bool owned = false;         // taken over by PublishOwned rather than by an engine map
 			// Every slot in boundSlots has the record's latest upload bound (boundFirst/boundCount equal
 			// RingWindow), so RebindRecord would bind nothing. Set by RebindRecord; cleared by CopyToRing
 			// (new range) and ForgetBindings, false for a new record. ApplyBinds binds every slot it tracks
@@ -106,6 +110,8 @@ namespace ConstantBufferRing
 			bool uploadFailed = false;
 			bool warnedThread = false;
 			bool persistentMapping = false;  // DXVK: uploads write through ringData (see Wrap)
+			bool ringReadProbed = false;
+			bool ringReadable = false;  // true when ringData reads at host-cached RAM speed (skip lastUpload copy)
 			std::atomic_bool active{ false };
 			std::atomic_bool requested{ true };
 
@@ -124,10 +130,12 @@ namespace ConstantBufferRing
 
 			uint32_t uploadsThisFrame = 0;
 			uint32_t uploadsLastFrame = 0;
+			uint32_t directUploadsThisFrame = 0;
 			uint32_t dedupedThisFrame = 0;
 			uint32_t rebindsSkippedThisFrame = 0;
 			uint32_t ownedPublishesThisFrame = 0;
 			uint64_t uploadsSinceActivation = 0;
+			uint64_t directUploadsSinceActivation = 0;
 			uint64_t dedupedSinceActivation = 0;
 			uint64_t rebindsSkippedSinceActivation = 0;
 			uint64_t ownedPublishesSinceActivation = 0;
@@ -230,6 +238,36 @@ namespace ConstantBufferRing
 			a_record.bindingsCurrent = true;
 		}
 
+		void ProbeRingReadable(const std::byte* a_data)
+		{
+			g.ringReadProbed = true;
+			LARGE_INTEGER freq{}, t0{}, t1{};
+			if (!a_data || !QueryPerformanceFrequency(&freq) || freq.QuadPart == 0) {
+				g.ringReadable = false;
+				return;
+			}
+			// Read 256 cache lines (16 KiB): host-cached RAM (=c) takes ~1-3 us; WC BAR/VRAM takes ~80-400 us.
+			QueryPerformanceCounter(&t0);
+			uint64_t acc = 0;
+			const auto* p = reinterpret_cast<const volatile uint64_t*>(a_data);
+			for (size_t i = 0; i < 256; ++i)
+				acc += p[i * 8];
+			QueryPerformanceCounter(&t1);
+			(void)acc;
+			const double us = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+			g.ringReadable = us < 25.0;
+			logger::info("[CB Ring] Ring read probe: {:.1f} us/16KiB -> ringReadable={} ({})",
+				us, g.ringReadable, g.ringReadable ? "skip lastUpload copy" : "keep lastUpload copy");
+		}
+
+		void SyncStaleShadow(Record& a_record)
+		{
+			if (a_record.shadowStale && g.ringData && a_record.generation == g.generation) {
+				std::memcpy(a_record.shadow.get(), g.ringData + a_record.firstConstant * kConstantBytes, a_record.byteWidth);
+				a_record.shadowStale = false;
+			}
+		}
+
 		/** @brief Copies the shadow into the ring at the cursor. Space must already be available. */
 		void CopyToRing(Record& a_record)
 		{
@@ -253,7 +291,10 @@ namespace ConstantBufferRing
 					return;
 				}
 			}
-			std::memcpy(a_record.lastUpload.get(), a_record.shadow.get(), a_record.byteWidth);
+			// When ringData is host-cached RAM, dedupe compares directly against ringData[firstConstant] with no second copy.
+			if (!g.ringReadable || !g.ringData)
+				std::memcpy(a_record.lastUpload.get(), a_record.shadow.get(), a_record.byteWidth);
+			a_record.shadowStale = false;
 			a_record.firstConstant = g.cursor / kConstantBytes;
 			a_record.generation = g.generation;
 			a_record.bindingsCurrent = false;  // its slots still show the previous range
@@ -264,6 +305,15 @@ namespace ConstantBufferRing
 		/** @brief Discards the ring and re-uploads and rebinds every buffer that is still bound. */
 		void Wrap()
 		{
+			// Before discarding the old ring storage, bring every direct-written record's shadow up to date so
+			// wrap re-uploads and later binds after this wrap still have its latest bytes.
+			if (g.ringData) {
+				for (auto& record : g.records) {
+					if (!record->mapped)
+						SyncStaleShadow(*record);
+				}
+			}
+
 			D3D11_MAPPED_SUBRESOURCE mapped{};
 			if (FAILED(g.map(g.context, g.ring.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 				g.ringData = nullptr;
@@ -275,6 +325,8 @@ namespace ConstantBufferRing
 			// The ring is still unmapped right away, so no draw ever uses it while it is mapped.
 			g.ringData = g.persistentMapping ? static_cast<std::byte*>(mapped.pData) : nullptr;
 			g.unmap(g.context, g.ring.get(), 0);
+			if (g.ringData && !g.ringReadProbed)
+				ProbeRingReadable(g.ringData);
 			g.cursor = 0;
 			if (++g.generation == 0)
 				g.generation = 1;
@@ -317,8 +369,9 @@ namespace ConstantBufferRing
 				logger::error("[CB Ring] Could not restore an engine constant buffer ({} bytes)", a_record.byteWidth);
 				return;
 			}
+			const void* src = (a_record.directMapped && a_record.directPtr) ? static_cast<const void*>(a_record.directPtr) : static_cast<const void*>(a_record.shadow.get());
 			if (mapped.pData)
-				std::memcpy(mapped.pData, a_record.shadow.get(), a_record.byteWidth);
+				std::memcpy(mapped.pData, src, a_record.byteWidth);
 			g.unmap(g.context, a_record.buffer, 0);
 		}
 
@@ -420,6 +473,7 @@ namespace ConstantBufferRing
 			g.ringData = nullptr;
 			g.uploadFailed = false;
 			g.uploadsSinceActivation = 0;
+			g.directUploadsSinceActivation = 0;
 			g.dedupedSinceActivation = 0;
 			g.rebindsSkippedSinceActivation = 0;
 			g.ownedPublishesSinceActivation = 0;
@@ -455,6 +509,7 @@ namespace ConstantBufferRing
 					g.draining.push_back(std::move(record));  // finished by its Unmap
 					continue;
 				}
+				SyncStaleShadow(*record);
 				FlushToEngineBuffer(*record);
 				record->buffer->Release();
 			}
@@ -484,8 +539,12 @@ namespace ConstantBufferRing
 		[[nodiscard]] bool Publish(Record& a_record)
 		{
 			// Contents equal to the latest upload, whose range no wrap has discarded since, reuse that range.
-			if (a_record.generation != 0 && a_record.generation == g.generation &&
-				std::memcmp(a_record.shadow.get(), a_record.lastUpload.get(), a_record.byteWidth) == 0) {
+			const void* prevData = (g.ringReadable && g.ringData) ?
+			                           static_cast<const void*>(g.ringData + a_record.firstConstant * kConstantBytes) :
+			                           static_cast<const void*>(a_record.lastUpload.get());
+			if (a_record.generation != 0 && a_record.generation == g.generation && !a_record.shadowStale &&
+				std::memcmp(a_record.shadow.get(), prevData, a_record.byteWidth) == 0) {
+				a_record.changeStreak = 0;
 				++g.dedupedThisFrame;
 				// Nothing changed since every slot of the record was last bound to that range.
 				if (a_record.bindingsCurrent) {
@@ -493,6 +552,7 @@ namespace ConstantBufferRing
 					return true;
 				}
 			} else {
+				++a_record.changeStreak;
 				Upload(a_record);
 				if (g.uploadFailed) {
 					DisableForSession("a ring map failed");
@@ -804,6 +864,11 @@ namespace ConstantBufferRing
 		return status;
 	}
 
+	bool IsDXVK()
+	{
+		return g.persistentMapping;
+	}
+
 	void OnFrameBoundary()
 	{
 		if (!g.supported)
@@ -819,6 +884,7 @@ namespace ConstantBufferRing
 
 		g.uploadsLastFrame = std::exchange(g.uploadsThisFrame, 0);
 		g.uploadsSinceActivation += g.uploadsLastFrame;
+		g.directUploadsSinceActivation += std::exchange(g.directUploadsThisFrame, 0);
 		g.dedupedSinceActivation += std::exchange(g.dedupedThisFrame, 0);
 		g.rebindsSkippedSinceActivation += std::exchange(g.rebindsSkippedThisFrame, 0);
 		g.ownedPublishesSinceActivation += std::exchange(g.ownedPublishesThisFrame, 0);
@@ -836,11 +902,12 @@ namespace ConstantBufferRing
 		if (g.active.load(std::memory_order_relaxed) && !g.loggedStats && ++g.framesSinceActivation == kStatsLogFrame) {
 			g.loggedStats = true;
 			const auto ownedBuffers = std::ranges::count_if(g.records, [](const auto& a_record) { return a_record->owned; });
-			logger::info("[CB Ring] After {} frames: {} engine constant buffers on the ring, {:.0f} uploads per frame, {:.0f} unchanged uploads skipped per frame, {:.0f} rebinds skipped per frame, {} ring wraps, {:.0f} owned publishes per frame ({} Community Shaders constant buffers on the ring)",
+			logger::info("[CB Ring] After {} frames: {} engine CBs, {:.0f} uploads/frame ({:.0f} direct zero-copy), {:.0f} deduped/frame, {:.0f} rebinds skipped/frame, {} wraps, {:.0f} owned publishes/frame ({} CS CBs), ringReadable={}",
 				kStatsLogFrame, g.records.size() - static_cast<std::size_t>(ownedBuffers), static_cast<double>(g.uploadsSinceActivation) / kStatsLogFrame,
+				static_cast<double>(g.directUploadsSinceActivation) / kStatsLogFrame,
 				static_cast<double>(g.dedupedSinceActivation) / kStatsLogFrame,
 				static_cast<double>(g.rebindsSkippedSinceActivation) / kStatsLogFrame, g.wrapsSinceActivation,
-				static_cast<double>(g.ownedPublishesSinceActivation) / kStatsLogFrame, ownedBuffers);
+				static_cast<double>(g.ownedPublishesSinceActivation) / kStatsLogFrame, ownedBuffers, g.ringReadable);
 		}
 	}
 
@@ -862,8 +929,34 @@ namespace ConstantBufferRing
 				return false;
 		}
 
-		// The shadow always holds the latest contents, which satisfies both DISCARD (contents undefined)
-		// and NO_OVERWRITE (contents preserved); Unmap publishes it to a fresh ring range either way.
+		// High-churn engine CBs (per-object transforms that rarely repeat): hand the engine a fresh slice of
+		// ringData directly on WRITE_DISCARD so Map+Unmap does zero memcmp and zero memcpy. Keep 128 KiB of
+		// wrap-free headroom while the pointer is out, and probe through shadow every 256th map so a buffer
+		// that stops churning (e.g. interior/menu) re-enables dedupe cleanly.
+		if (a_mapType == D3D11_MAP_WRITE_DISCARD && !record->owned && !record->mapped &&
+			record->changeStreak >= 16 && g.ringData != nullptr && g.mappedCount == 0 &&
+			(g.cursor + record->allocBytes + (kMaxManagedBytes * 2) <= kRingBytes)) {
+			if (++record->directUses >= 256) {
+				record->directUses = 0;
+				record->changeStreak = 14;  // two shadow cycles: first refreshes baseline, second checks dedupe
+			} else {
+				record->directOffset = g.cursor;
+				g.cursor += record->allocBytes;
+				record->directPtr = g.ringData + record->directOffset;
+				record->directMapped = true;
+				record->mapped = true;
+				++g.mappedCount;
+				a_mapped->pData = record->directPtr;
+				a_mapped->RowPitch = record->byteWidth;
+				a_mapped->DepthPitch = record->byteWidth;
+				return true;
+			}
+		}
+
+		// WRITE_NO_OVERWRITE expects the latest contents to still be in the mapped buffer.
+		if (a_mapType == D3D11_MAP_WRITE_NO_OVERWRITE && record->shadowStale)
+			SyncStaleShadow(*record);
+
 		if (!record->mapped) {
 			record->mapped = true;
 			++g.mappedCount;
@@ -884,6 +977,18 @@ namespace ConstantBufferRing
 		if (Record* record = Find(a_resource); record && record->mapped) {
 			record->mapped = false;
 			--g.mappedCount;
+			if (record->directMapped) {
+				record->directMapped = false;
+				record->directPtr = nullptr;
+				record->firstConstant = record->directOffset / kConstantBytes;
+				record->generation = g.generation;
+				record->bindingsCurrent = false;
+				record->shadowStale = true;
+				++g.uploadsThisFrame;
+				++g.directUploadsThisFrame;
+				RebindRecord(*record);
+				return true;
+			}
 			// When a ring map fails, deactivation writes the shadow into the engine buffer itself, so this
 			// update still lands either way.
 			(void)Publish(*record);

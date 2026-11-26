@@ -100,4 +100,10 @@ namespace Util
 	 * @return The depth SRV, or nullptr if unavailable.
 	 */
 	ID3D11ShaderResourceView* GetCurrentSceneDepthSRV(bool prefer16bit = false);
+
+	/**
+	 * @brief Copy only the active dynamic-resolution region of a 2D texture when upscaling is active,
+	 *        falling back to CopyResource at native resolution (or for depth on non-DXVK drivers).
+	 */
+	void CopyDynamicTexture(ID3D11DeviceContext* a_context, ID3D11Resource* a_dst, ID3D11Resource* a_src, bool a_isDepth = false);
 }  // namespace Util

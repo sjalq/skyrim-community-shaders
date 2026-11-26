@@ -84,6 +84,9 @@ namespace ConstantBufferRing
 	/** @brief Current support/activity for display. Call on the render thread. */
 	[[nodiscard]] Status GetStatus();
 
+	/** @brief True when DXVK was detected at Install() (persistent ring mapping & partial depth copies supported). */
+	[[nodiscard]] bool IsDXVK();
+
 	/** @brief Applies a pending toggle or a failure fallback. Call once per frame at Present. */
 	void OnFrameBoundary();
 
