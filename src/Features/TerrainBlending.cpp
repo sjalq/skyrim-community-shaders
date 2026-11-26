@@ -305,8 +305,11 @@ void TerrainBlending::Hooks::BSBatchRenderer__RenderPassImmediately::thunk(RE::B
 
 	if (shaderCache->IsEnabled() && singleton.settings.Enabled) {
 		if (singleton.renderDepth) {
-			// Entering or exiting terrain depth section
-			bool inTerrain = a_pass->shaderProperty && a_pass->shaderProperty->flags.all(RE::BSShaderProperty::EShaderPropertyFlag::kMultiTextureLandscape);
+			// Entering or exiting terrain depth section.
+			// Only Utility passes (techniques < 0x4000002C) can be multi-texture landscape; skip
+			// cold shaderProperty dereferences on Grass (0x5C00005C) and DistantTree depth passes.
+			bool inTerrain = a_technique < 0x4000002Cu && a_pass->shaderProperty &&
+			                 a_pass->shaderProperty->flags.all(RE::BSShaderProperty::EShaderPropertyFlag::kMultiTextureLandscape);
 
 			if (inTerrain && a_pass->geometry) {
 				if ((a_pass->geometry->worldBound.center.GetDistance(singleton.eyePosition) - a_pass->geometry->worldBound.radius) > 1024.0f) {
@@ -323,7 +326,8 @@ void TerrainBlending::Hooks::BSBatchRenderer__RenderPassImmediately::thunk(RE::B
 			if (inTerrain) {
 				func(a_pass, a_technique, a_alphaTest, a_renderFlags);  // Run terrain twice
 			}
-		} else if (globals::state->inWorld) {
+		} else if (globals::state->inWorld && (a_technique - 0x4800002Du) < (0x5C00002Eu - 0x4800002Du)) {
+			// Only BSLightingShader passes (techniques 0x4800002D..0x5C00002D) need inspection here.
 			if (auto shaderProperty = a_pass->shaderProperty) {
 				if (a_pass->shader->shaderType.get() == RE::BSShader::Type::Lighting) {
 					if (shaderProperty->flags.all(RE::BSShaderProperty::EShaderPropertyFlag::kMultiTextureLandscape)) {

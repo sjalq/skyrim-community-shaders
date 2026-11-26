@@ -85,6 +85,7 @@ void TerrainVariation::DataLoaded()
 	landscapeDiffusePaths.clear();
 	meshTextureCache.clear();
 	meshTextureKeepAlive.clear();
+	fastMeshTextureCache.fill({});
 
 	auto addTextureSet = [this](RE::BGSTextureSet* textureSet) {
 		if (textureSet == nullptr) {
@@ -116,9 +117,15 @@ bool TerrainVariation::IsLandscapeDiffuseTexture(const RE::BSFixedString& a_name
 		return false;
 	}
 
+	const size_t fastSlot = ((reinterpret_cast<uintptr_t>(key) >> 4) ^ (reinterpret_cast<uintptr_t>(key) >> 11)) & (fastMeshTextureCache.size() - 1);
+	if (const auto& entry = fastMeshTextureCache[fastSlot]; entry.key == key) {
+		return entry.value;
+	}
+
 	{
 		const std::shared_lock lock(meshTextureMutex);
 		if (auto it = meshTextureCache.find(key); it != meshTextureCache.end()) {
+			fastMeshTextureCache[fastSlot] = { key, it->second };
 			return it->second;
 		}
 	}
@@ -131,6 +138,7 @@ bool TerrainVariation::IsLandscapeDiffuseTexture(const RE::BSFixedString& a_name
 		meshTextureKeepAlive.push_back(a_name);
 	}
 
+	fastMeshTextureCache[fastSlot] = { key, it->second };
 	return it->second;
 }
 

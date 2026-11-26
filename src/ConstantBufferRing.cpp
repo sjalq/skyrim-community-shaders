@@ -1,7 +1,9 @@
 #include "ConstantBufferRing.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cmath>
 #include <d3d11_1.h>
 #include <functional>
 
@@ -121,9 +123,14 @@ namespace ConstantBufferRing
 
 			std::vector<std::unique_ptr<Record>> records;
 			ankerl::unordered_dense::map<const void*, Record*> managed;
-			// Latest Find() result (null record for an unmanaged buffer); reset whenever `managed` changes.
-			const void* findKey = nullptr;
-			Record* findRecord = nullptr;
+			// 128-entry direct-mapped L1 lookup cache (2 KiB) avoiding hash probes when alternating CBs.
+			struct FindEntry
+			{
+				const void* key = nullptr;
+				Record* record = nullptr;
+			};
+			static constexpr size_t kFindCacheMask = 127u;
+			std::array<FindEntry, kFindCacheMask + 1u> findCache{};
 			std::vector<std::unique_ptr<Record>> draining;  // still mapped by the engine when the ring went off
 			uint32_t mappedCount = 0;
 			std::array<std::array<Slot, kSlotCount>, kStageCount> slots{};
@@ -181,19 +188,19 @@ namespace ConstantBufferRing
 		{
 			if (!a_resource)
 				return nullptr;
-			// The engine maps, unmaps and binds the same buffer back to back, so the latest lookup is kept.
-			if (a_resource == g.findKey)
-				return g.findRecord;
+			const uintptr_t h = reinterpret_cast<uintptr_t>(a_resource);
+			auto& entry = g.findCache[((h >> 4) ^ (h >> 11)) & RingState::kFindCacheMask];
+			if (entry.key == a_resource)
+				return entry.record;
 			const auto it = g.managed.find(a_resource);
-			g.findKey = a_resource;
-			g.findRecord = it != g.managed.end() ? it->second : nullptr;
-			return g.findRecord;
+			Record* rec = it != g.managed.end() ? it->second : nullptr;
+			entry = { a_resource, rec };
+			return rec;
 		}
 
 		void ForgetFindCache()
 		{
-			g.findKey = nullptr;
-			g.findRecord = nullptr;
+			g.findCache.fill({});
 		}
 
 		[[nodiscard]] uint16_t SlotBit(UINT a_index)
@@ -666,6 +673,40 @@ namespace ConstantBufferRing
 					func(This, StartSlot, NumBuffers, ppConstantBuffers);
 					return;
 				}
+				if (NumBuffers == 1) {
+					ID3D11Buffer* buf = ppConstantBuffers[0];
+					Slot& slot = g.slots[S][StartSlot];
+					if (slot.logical == buf && slot.record && slot.windowFirst == 0 && slot.windowCount == kInvalid) {
+						Record* rec = slot.record;
+						if (rec->generation == g.generation && slot.boundFirst == rec->firstConstant && slot.boundCount == rec->numConstants)
+							return;
+					}
+					Record* rec = Find(buf);
+					if (!rec) {
+						func(This, StartSlot, 1, ppConstantBuffers);
+						if (slot.record) {
+							slot.record->boundSlots[S] = static_cast<uint16_t>(slot.record->boundSlots[S] & ~SlotBit(StartSlot));
+							slot.record = nullptr;
+							slot.boundFirst = kInvalid;
+							slot.boundCount = 0;
+						}
+						slot.logical = buf;
+						slot.windowFirst = 0;
+						slot.windowCount = kInvalid;
+						return;
+					}
+					if (rec->generation != g.generation) {
+						Upload(*rec);
+						if (g.uploadFailed) {
+							DisableForSession("a ring map failed");
+							func(This, StartSlot, 1, ppConstantBuffers);
+							return;
+						}
+					}
+					Track(S, StartSlot, buf, rec, 0, kInvalid);
+					BindRingSlot(S, StartSlot);
+					return;
+				}
 				ApplyBinds(S, StartSlot, NumBuffers, ppConstantBuffers, nullptr, nullptr, false);
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
@@ -707,6 +748,47 @@ namespace ConstantBufferRing
 				func(This, StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
 				if (Owns(This))
 					ReportApplicationBindings(S, StartSlot, NumBuffers, ppConstantBuffers, pFirstConstant, pNumConstants);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
+		struct CopyResourceHook
+		{
+			static void thunk(ID3D11DeviceContext* This, ID3D11Resource* pDstResource, ID3D11Resource* pSrcResource)
+			{
+				// Vanilla Skyrim performs several full-resolution CopyResource calls on kMAIN depth
+				// (kMAIN -> kPOST_ZPREPASS_COPY / kMAIN_COPY) before upscaling while dynamic resolution
+				// only renders the top-left viewport. On DXVK, sub-region D24S8 copies work cleanly and
+				// cut copy bandwidth by ~4x at 50% scale.
+				if (g.persistentMapping && This == g.context && OnRenderThread() && pDstResource && pSrcResource && pDstResource != pSrcResource) {
+					auto* viewport = globals::game::graphicsState;
+					auto* renderer = globals::game::renderer;
+					if (viewport && renderer) {
+						const auto& rt = viewport->GetRuntimeData();
+						if (!rt.dynamicResolutionLock && rt.dynamicResolutionWidthRatio > 0.0f && rt.dynamicResolutionHeightRatio > 0.0f &&
+							(rt.dynamicResolutionWidthRatio < 0.995f || rt.dynamicResolutionHeightRatio < 0.995f)) {
+							auto& ds = renderer->GetDepthStencilData().depthStencils;
+							if (pSrcResource == ds[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].texture &&
+								(pDstResource == ds[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].texture ||
+									pDstResource == ds[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN_COPY].texture)) {
+								const UINT w = static_cast<UINT>(viewport->screenWidth);
+								const UINT h = static_cast<UINT>(viewport->screenHeight);
+								if (w > 0 && h > 0) {
+									D3D11_BOX box{};
+									box.left = 0;
+									box.top = 0;
+									box.front = 0;
+									box.right = std::min(w, static_cast<UINT>(std::ceil(static_cast<float>(w) * rt.dynamicResolutionWidthRatio)) + 4u);
+									box.bottom = std::min(h, static_cast<UINT>(std::ceil(static_cast<float>(h) * rt.dynamicResolutionHeightRatio)) + 4u);
+									box.back = 1;
+									This->CopySubresourceRegion(pDstResource, 0, 0, 0, 0, pSrcResource, 0, &box);
+									return;
+								}
+							}
+						}
+					}
+				}
+				func(This, pDstResource, pSrcResource);
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
@@ -762,6 +844,7 @@ namespace ConstantBufferRing
 				DetourVFunc<100, GetConstantBuffers<kHS>>(a_context),
 				DetourVFunc<104, GetConstantBuffers<kDS>>(a_context),
 				DetourVFunc<109, GetConstantBuffers<kCS>>(a_context),
+				DetourVFunc<47, CopyResourceHook>(a_context),
 				DetourVFunc<58, ExecuteCommandList>(a_context),
 				DetourVFunc<110, ClearState>(a_context),
 				DetourVFunc<119, SetConstantBuffers1<kVS>>(a_context1),

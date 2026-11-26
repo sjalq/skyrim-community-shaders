@@ -334,19 +334,22 @@ float Skin::GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a
 float4 Skin::GetWetness(RE::BSGeometry* geometry)
 {
 	float4 wetness = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	if (!geometry) {
+		return wetness;
+	}
 	const uint currentFrame = globals::state->frameCount;
-	RE::TESObjectREFR* userData = geometry->userData;
-	if (!userData) {
-		if (auto* parent = geometry->parent) {
-			const size_t slot = (reinterpret_cast<uintptr_t>(parent) >> 6) & (parentUserDataCache.size() - 1);
-			auto& entry = parentUserDataCache[slot];
-			if (entry.frame == currentFrame && entry.parent == parent) {
-				userData = entry.userData;
-			} else {
-				userData = parent->GetUserData();
-				entry = { parent, userData, currentFrame };
-			}
+	RE::TESObjectREFR* userData = nullptr;
+	if (auto* parent = geometry->parent) {
+		const size_t slot = (reinterpret_cast<uintptr_t>(parent) >> 6) & (parentUserDataCache.size() - 1);
+		auto& entry = parentUserDataCache[slot];
+		if (entry.frame == currentFrame && entry.parent == parent) {
+			userData = entry.userData;
+		} else {
+			userData = geometry->GetUserData();
+			entry = { parent, userData, currentFrame };
 		}
+	} else {
+		userData = geometry->GetUserData();
 	}
 	if (userData && userData->formType == RE::FormType::ActorCharacter) {
 		auto actor = static_cast<RE::Character*>(userData);
@@ -583,26 +586,40 @@ void Skin::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const
 
 void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 {
-	if (settings.EnableSkin) {
-		auto geometry = a_pass->geometry;
-		float4 wetness = GetWetness(geometry);
+	if (!settings.EnableSkin || !a_pass || !a_pass->shaderProperty) {
+		return;
+	}
 
-		bool updated = false;
-		if (currentWetness != wetness) {
-			currentWetness = wetness;
-			PerGeometryData perGeometryData{};
-			perGeometryData.skinPerGeometry = wetness;
-			// Per draw, so through the constant buffer ring while it is active (no DXVK buffer rename per change).
-			if (!ConstantBufferRing::PublishOwned(PerGeometryCB->CB(), &perGeometryData, sizeof(perGeometryData)))
-				PerGeometryCB->Update(perGeometryData);
-			updated = true;
-		}
+	// Lighting.hlsl only defines SKIN (and reads SkinPerGeometry cb7) for FACEGEN / FACEGEN_RGB_TINT.
+	// Skip the per-draw NiAVObject::GetUserData() scenegraph walk on ~99% of world draws.
+	const auto* material = a_pass->shaderProperty->material;
+	if (!material) {
+		return;
+	}
+	const auto feature = material->GetFeature();
+	if (feature != RE::BSShaderMaterial::Feature::kFaceGen &&
+		feature != RE::BSShaderMaterial::Feature::kFaceGenRGBTint) {
+		return;
+	}
 
-		if (updated || !perGeometryCBBound) {
-			ID3D11Buffer* buffer = { PerGeometryCB->CB() };
-			globals::d3d::context->PSSetConstantBuffers(7, 1, &buffer);
-			perGeometryCBBound = true;
-		}
+	auto geometry = a_pass->geometry;
+	float4 wetness = GetWetness(geometry);
+
+	bool updated = false;
+	if (currentWetness != wetness) {
+		currentWetness = wetness;
+		PerGeometryData perGeometryData{};
+		perGeometryData.skinPerGeometry = wetness;
+		// Per draw, so through the constant buffer ring while it is active (no DXVK buffer rename per change).
+		if (!ConstantBufferRing::PublishOwned(PerGeometryCB->CB(), &perGeometryData, sizeof(perGeometryData)))
+			PerGeometryCB->Update(perGeometryData);
+		updated = true;
+	}
+
+	if (updated || !perGeometryCBBound) {
+		ID3D11Buffer* buffer = { PerGeometryCB->CB() };
+		globals::d3d::context->PSSetConstantBuffers(7, 1, &buffer);
+		perGeometryCBBound = true;
 	}
 }
 

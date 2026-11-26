@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -72,6 +73,13 @@ public:
 	std::unordered_map<const char*, bool> meshTextureCache;
 	// Keeps every cached key interned so its pointer cannot be recycled.
 	std::vector<RE::BSFixedString> meshTextureKeepAlive;
+	// Lock-free render-thread direct-mapped cache for interned BSFixedString pointers.
+	struct FastTextureCacheEntry
+	{
+		const char* key = nullptr;
+		bool value = false;
+	};
+	std::array<FastTextureCacheEntry, 256> fastMeshTextureCache{};
 
 	/**
 	 * @brief Resolves whether a diffuse texture name belongs to a landscape texture, memoising the result.
