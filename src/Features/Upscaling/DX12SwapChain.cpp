@@ -712,10 +712,15 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// The frame being presented: State::Reset() already advanced frameCount for the next frame
 	// before this present ran, so the frame whose Reflex sleep/markers used frameCount is - 1.
 	const uint32_t presentFrameIndex = globals::state ? globals::state->frameCount - 1 : 0;
+	bool dlssgGenerating = false;
+	const bool fpsLock = useDLSSG && upscaling.FrameGenLockActive();
+	if (!fpsLock && upscaling.fgLock.multiplier)
+		upscaling.FrameGenLockReset();
 
 	if (useDLSSG) {
 		auto& slDX12 = upscaling.streamlineDX12;
 		const bool dlssgEnabled = useFrameGeneration && slDX12.featureDLSSG && depthInput && motionVectorInput;
+		dlssgGenerating = dlssgEnabled;
 
 		if (auto* token = slDX12.GetFrameToken(presentFrameIndex)) {
 			slDX12.SetFrameConstants(*token, slDX12.viewport);
@@ -743,8 +748,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		// Keep DLSS-G's resources while frame generation is only paused (menus); release them when
 		// frame generation is switched off in the settings.
 		const auto& settings = upscaling.settings;
-		slDX12.ConfigureDLSSG(dlssgEnabled, settings.frameGenerationMode != 0, settings.dlssgFramesToGenerate,
-			settings.dlssgDynamic, settings.dlssgDynamicTargetFps, settings.dlssgUIRecomposition && CanSeparateUIForDLSSG());
+		// Presented-FPS lock: CS picks the fixed multiplier (Dynamic MFG off while it runs).
+		const uint32_t framesToGenerate = fpsLock ? upscaling.FrameGenLockMultiplier() - 1 : settings.dlssgFramesToGenerate;
+		slDX12.ConfigureDLSSG(dlssgEnabled, settings.frameGenerationMode != 0, framesToGenerate,
+			settings.dlssgDynamic && !fpsLock, settings.dlssgDynamicTargetFps, settings.dlssgUIRecomposition && CanSeparateUIForDLSSG());
 	} else {
 		const auto& settings = upscaling.settings;
 		upscaling.fidelityFX.ApplyFramePacingTuning(settings.fsrFGPacingSafetyMarginMs, settings.fsrFGPacingVarianceFactor);
@@ -786,8 +793,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	float clearColor[4]{ 0, 0, 0, 0 };
 	d3d11Context->ClearRenderTargetView(uiBufferWrapped->rtv, clearColor);
 
-	// If VSync is disabled, use frame limiter to prevent tearing and optimise pacing
-	if (SyncInterval == 0)
+	// Presented-FPS lock: cap rendered frames at lock / multiplier, with VSync on or off.
+	// Otherwise, if VSync is disabled, use frame limiter to prevent tearing and optimise pacing
+	if (fpsLock)
+		upscaling.FrameGenLockLimiter(dlssgGenerating);
+	else if (SyncInterval == 0)
 		upscaling.FrameLimiter();
 
 	return S_OK;

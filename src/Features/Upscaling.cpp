@@ -43,6 +43,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameGenerationPreferDLSSG,
 	dlssgDynamic,
 	dlssgDynamicTargetFps,
+	dlssgLock,
+	dlssgLockFps,
+	dlssgLockMinFps,
 	dlssgUIRecomposition,
 	frameGenerationReflexMode,
 	frameGenerationPipelined,
@@ -467,6 +470,18 @@ void Upscaling::DrawSettings()
 					ImGui::TextDisabled("%s", T(TKEY("dlssg_dynamic_unsupported"), "Dynamic Multi Frame Generation is not supported here; the fixed multiplier is used."));
 			}
 
+			ImGui::Checkbox(T(TKEY("dlssg_lock"), "Lock Presented FPS"), &settings.dlssgLock);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(T(TKEY("dlssg_lock_tooltip_1"), "Picks the multiplier itself and caps rendered frames at target / multiplier, so the presented frame rate stays between the minimum and the target, with VSync on or off. Overrides Dynamic Multi Frame Generation."));
+				ImGui::TextUnformatted(T(TKEY("dlssg_lock_tooltip_2"), "0 = auto: target = refresh - refresh^2 / 3600 (157 at 165 Hz), minimum = 93% of the target. Applies immediately."));
+			}
+			if (settings.dlssgLock) {
+				ImGui::SliderFloat(T(TKEY("dlssg_lock_fps"), "Lock Target FPS (0 = auto)"), &settings.dlssgLockFps, 0.0f, 360.0f, "%.0f");
+				ImGui::SliderFloat(T(TKEY("dlssg_lock_min_fps"), "Lock Minimum FPS (0 = auto)"), &settings.dlssgLockMinFps, 0.0f, 360.0f, "%.0f");
+				if (fgLock.multiplier)
+					ImGui::Text("%s %ux, %.1f / %.1f FPS", T(TKEY("dlssg_lock_status"), "Lock: multiplier, rendered cap / engine capable"), fgLock.multiplier, fgLock.capFps, fgLock.capableFps);
+			}
+
 			ImGui::Checkbox(T(TKEY("dlssg_ui_recomposition"), "UI Recomposition"), &settings.dlssgUIRecomposition);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(T(TKEY("dlssg_ui_recomposition_tooltip"), "Interpolates the HUD-less scene and the UI separately for cleaner UI. Slight performance and memory cost."));
@@ -662,6 +677,14 @@ void Upscaling::LoadSettings(json& o_json)
 	if (!std::isfinite(settings.dlssgDynamicTargetFps) || settings.dlssgDynamicTargetFps < 0.0f || settings.dlssgDynamicTargetFps > 1000.0f) {
 		logger::warn("[Upscaling] Loaded dlssgDynamicTargetFps {} out of range, using the display refresh rate", settings.dlssgDynamicTargetFps);
 		settings.dlssgDynamicTargetFps = 0.0f;
+	}
+	if (!std::isfinite(settings.dlssgLockFps) || settings.dlssgLockFps < 0.0f || settings.dlssgLockFps > 1000.0f) {
+		logger::warn("[Upscaling] Loaded dlssgLockFps {} out of range, using auto (refresh based)", settings.dlssgLockFps);
+		settings.dlssgLockFps = 0.0f;
+	}
+	if (!std::isfinite(settings.dlssgLockMinFps) || settings.dlssgLockMinFps < 0.0f || settings.dlssgLockMinFps > 1000.0f) {
+		logger::warn("[Upscaling] Loaded dlssgLockMinFps {} out of range, using auto (93% of the lock)", settings.dlssgLockMinFps);
+		settings.dlssgLockMinFps = 0.0f;
 	}
 	if (settings.frameGenerationReflexMode < -1 || settings.frameGenerationReflexMode > 2) {
 		logger::warn("[Upscaling] Loaded frameGenerationReflexMode {} out of range, using -1 (default)", settings.frameGenerationReflexMode);
@@ -1290,6 +1313,140 @@ void Upscaling::TimerSleepQPC(int64_t targetQPC)
 	do {
 		QueryPerformanceCounter(&currentQPC);
 	} while (currentQPC.QuadPart < targetQPC);
+}
+
+// Presented-FPS lock (settings.dlssgLock). Dynamic MFG keeps the presented rate below the refresh rate
+// with a margin and leaves gaps where no integer multiplier fits (an engine at 45 FPS presents 3x = 135),
+// and the limiter below only runs with VSync off. The lock picks the smallest multiplier N whose output
+// reaches the minimum at the engine's measured capability (90th percentile work time per rendered frame,
+// excluding the lock's own wait) and caps rendered frames at lock / N, so presented frames sit in
+// [minimum, lock]. Switching up is quick (3 frames), switching down needs a sustained 8% margin and backs
+// off when it flaps.
+namespace
+{
+	void ResolveFrameGenLockTargets(const Upscaling::Settings& a_settings, double a_refreshRate, double& a_lockFps, double& a_minFps)
+	{
+		const double refresh = a_refreshRate >= 30.0 ? a_refreshRate : 60.0;
+		a_lockFps = a_settings.dlssgLockFps > 0.0f ? static_cast<double>(a_settings.dlssgLockFps) : refresh - refresh * refresh / 3600.0;
+		a_minFps = a_settings.dlssgLockMinFps > 0.0f ? std::min(static_cast<double>(a_settings.dlssgLockMinFps), a_lockFps) : a_lockFps * 0.93;
+	}
+}
+
+bool Upscaling::FrameGenLockActive() const
+{
+	return settings.dlssgLock && settings.frameGenerationMode != 0 && UsesDLSSGFrameGen();
+}
+
+void Upscaling::FrameGenLockReset()
+{
+	if (fgLock.multiplier)
+		logger::info("[Frame Generation] FPS lock off");
+	fgLock = FrameGenLock{};
+}
+
+uint32_t Upscaling::FrameGenLockMultiplier()
+{
+	auto& s = fgLock;
+	const uint32_t maxMultiplier = std::max(streamlineDX12.dlssgFramesToGenerateMax, 1u) + 1;
+	if (s.multiplier == 0 || maxMultiplier != s.maxMultiplier) {
+		// (Re)start at the top: the controller steps down once the engine has been measured.
+		double lockFps = 0.0, minFps = 0.0;
+		ResolveFrameGenLockTargets(settings, refreshRate, lockFps, minFps);
+		s.multiplier = maxMultiplier;
+		s.maxMultiplier = maxMultiplier;
+		s.upFrames = s.downFrames = 0;
+		logger::info("[Frame Generation] FPS lock on: presented {:.1f}-{:.1f} FPS (refresh {:.2f} Hz), starting at {}x (GPU max {}x)",
+			minFps, lockFps, refreshRate, s.multiplier, maxMultiplier);
+	}
+	return s.multiplier;
+}
+
+void Upscaling::SleepUntilQPC(int64_t targetQPC) const
+{
+	// Sleep in 1 ms steps while more than 2 ms remain, then spin: precise without burning a core for
+	// the whole wait (TimerSleepQPC spins for all of it).
+	const int64_t ticks2ms = qpf.QuadPart / 500;
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	while (targetQPC - now.QuadPart > ticks2ms) {
+		Sleep(1);
+		QueryPerformanceCounter(&now);
+	}
+	while (now.QuadPart < targetQPC) {
+		YieldProcessor();
+		QueryPerformanceCounter(&now);
+	}
+}
+
+void Upscaling::FrameGenLockLimiter(bool generatingThisFrame)
+{
+	auto& s = fgLock;
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+
+	if (!generatingThisFrame || s.multiplier == 0 || s.lastExitQPC == 0 || qpf.QuadPart <= 0) {
+		// Menus, loading screens, the first frame: no cap, restart the measurement window.
+		s.lastExitQPC = now.QuadPart;
+		s.head = s.samples = 0;
+		s.upFrames = s.downFrames = 0;
+		return;
+	}
+
+	const double ticksPerMs = static_cast<double>(qpf.QuadPart) / 1000.0;
+	s.workMs[s.head] = static_cast<float>(static_cast<double>(now.QuadPart - s.lastExitQPC) / ticksPerMs);
+	s.head = (s.head + 1) % FrameGenLock::kWindow;
+	s.samples = std::min(s.samples + 1, FrameGenLock::kWindow);
+	s.framesSinceDown = std::min(s.framesSinceDown + 1, 1u << 30);
+	s.framesSinceUp = std::min(s.framesSinceUp + 1, 1u << 30);
+	if (s.framesSinceUp > 1800)
+		s.downHold = FrameGenLock::kMinDownHold;
+
+	double lockFps = 0.0, minFps = 0.0;
+	ResolveFrameGenLockTargets(settings, refreshRate, lockFps, minFps);
+	const uint32_t maxMultiplier = std::max(s.maxMultiplier, 2u);
+
+	if (s.samples >= 8) {
+		std::array<float, FrameGenLock::kWindow> sorted{};
+		std::copy_n(s.workMs.begin(), s.samples, sorted.begin());
+		const uint32_t idx = std::min(s.samples - 1, (s.samples * 9) / 10);
+		std::nth_element(sorted.begin(), sorted.begin() + idx, sorted.begin() + s.samples);
+		const double capableFps = 1000.0 / std::max(0.5, static_cast<double>(sorted[idx]));
+		s.capableFps = static_cast<float>(capableFps);
+
+		const uint32_t needed = std::clamp(static_cast<uint32_t>(std::ceil(minFps / capableFps - 1e-6)), 2u, maxMultiplier);
+		const uint32_t previous = s.multiplier;
+		if (needed > s.multiplier) {
+			s.downFrames = 0;
+			if (++s.upFrames >= FrameGenLock::kUpFrames) {
+				if (s.framesSinceDown < 150)
+					s.downHold = std::min(s.downHold * 2, FrameGenLock::kMaxDownHold);  // flapping: hold lower multipliers back longer
+				s.multiplier = needed;
+				s.upFrames = 0;
+				s.framesSinceUp = 0;
+			}
+		} else if (needed < s.multiplier && capableFps >= minFps / static_cast<double>(s.multiplier - 1) * 1.08) {
+			s.upFrames = 0;
+			if (++s.downFrames >= s.downHold) {
+				s.multiplier--;
+				s.downFrames = 0;
+				s.framesSinceDown = 0;
+			}
+		} else {
+			s.upFrames = 0;
+			s.downFrames = 0;
+		}
+		if (s.multiplier != previous)
+			logger::info("[Frame Generation] FPS lock: {}x -> {}x (engine p90 {:.1f} FPS, rendered cap {:.1f} FPS, presented {:.1f}-{:.1f}, down hold {} frames)",
+				previous, s.multiplier, capableFps, lockFps / s.multiplier, minFps, lockFps, s.downHold);
+	}
+
+	s.capFps = static_cast<float>(lockFps / s.multiplier);
+	const int64_t capTicks = static_cast<int64_t>(static_cast<double>(qpf.QuadPart) * static_cast<double>(s.multiplier) / lockFps);
+	if (now.QuadPart < s.lastExitQPC + capTicks)
+		SleepUntilQPC(s.lastExitQPC + capTicks);
+	LARGE_INTEGER exitQPC;
+	QueryPerformanceCounter(&exitQPC);
+	s.lastExitQPC = exitQPC.QuadPart;
 }
 
 void Upscaling::FrameLimiter()
