@@ -1,5 +1,38 @@
 #pragma once
 
+#include "RE/B/BSShadowDirectionalLight.h"
+#include "RE/N/NiFrustumPlanes.h"
+
+/**
+ * @brief Far directional shadow cascade (Cascade 1) temporal caching (Advanced > "Far Shadow Cache Interval").
+ *
+ * Cascade 0 (near shadows, 0..~15m) always renders every frame at full refresh rate.
+ * When interval > 1, Cascade 1 (far shadows, ~15..50m, ~650-700 draws) reuses its cached D16 shadow map slice
+ * and world-locked lightTransform on intermediate frames, skipping Cascade 1 culling and rendering.
+ * Automatically refreshes on cell change, interior, menu, sun movement, split change, camera translation/turn.
+ */
+namespace FarShadowCache
+{
+	inline constexpr int kMinInterval = 1;
+	inline constexpr int kMaxInterval = 8;
+
+	int GetInterval();
+	void SetInterval(int a_interval);
+
+	struct CullingGuard
+	{
+		RE::BSShadowDirectionalLight* light = nullptr;
+		RE::NiFrustumPlanes savedPlanes{};
+		bool clipped = false;
+
+		CullingGuard(RE::BSShadowDirectionalLight* a_light, const RE::TESObjectCELL* a_interiorCell);
+		~CullingGuard();
+
+		CullingGuard(const CullingGuard&) = delete;
+		CullingGuard& operator=(const CullingGuard&) = delete;
+	};
+}
+
 /**
  * @brief Overrides shadow cascade rasterizer states to fix peter-panning and self-shadowing.
  *

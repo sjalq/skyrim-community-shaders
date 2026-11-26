@@ -4,6 +4,7 @@
 
 #include "Buffer.h"
 #include "RE/B/BSShadowDirectionalLight.h"
+#include "RE/T/TESWaterReflections.h"
 #include "Utils/VersionedRelocation.h"
 
 #define ALBEDO RE::RENDER_TARGETS::kINDIRECT
@@ -150,6 +151,12 @@ public:
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
 
+		struct TESWaterReflections_UpdateActor
+		{
+			static bool thunk(RE::TESWaterReflections* a_this);
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
 		struct Main_RenderFirstPersonView
 		{
 			static void thunk(bool a1, bool a2);
@@ -166,6 +173,7 @@ public:
 		static void Install()
 		{
 			stl::write_vfunc<0x35, BSCubeMapCamera_RenderCubemap>(RE::VTABLE_BSCubeMapCamera[0]);
+			stl::detour_thunk<TESWaterReflections_UpdateActor>(REL::RelocationID(31373, 32160));
 
 			stl::write_thunk_call<Main_RenderShadowMaps>(REL::RelocationID(35560, 36559).address() + Util::VersionedRelocation::Select(0x2EC, 0x2EC, 0x30A));
 

@@ -1,4 +1,5 @@
 ﻿#include "InteriorSun.h"
+#include "EngineFixes/ShadowmapCascadeRasterizerFix.h"
 #include "I18n/I18n.h"
 #include "State.h"
 #include "Utils/VersionedRelocation.h"
@@ -126,6 +127,7 @@ void InteriorSun::DirShadowLightCulling::thunk(RE::BSShadowDirectionalLight* dir
 		singleton.currentCell = nullptr;
 	}
 
+	FarShadowCache::CullingGuard farShadowGuard(dirLight, cell);
 	func(dirLight, *passedJobArrays, nodes);
 }
 

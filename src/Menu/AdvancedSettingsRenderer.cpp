@@ -9,6 +9,7 @@
 #include "CSEditor/EditorWindow.h"
 #include "ConstantBufferRing.h"
 #include "Deferred.h"
+#include "EngineFixes/ShadowmapCascadeRasterizerFix.h"
 #include "FeatureIssues.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Fonts.h"
@@ -743,6 +744,17 @@ void AdvancedSettingsRenderer::RenderDeveloperSection()
 							  "and keeps the previous contents otherwise.\n"
 							  "1 updates every time (vanilla). Higher values save GPU and main-thread CPU time; reflections update more slowly.\n"
 							  "Every update still renders for 30 frames after a load, cell change or change of this value. Applies immediately."));
+	}
+
+	// Far directional shadow cascade (Cascade 1) temporal caching.
+	int farShadowCacheInterval = FarShadowCache::GetInterval();
+	if (ImGui::SliderInt(T("menu.advanced.far_shadow_cache_interval", "Far Shadow Cache Interval"), &farShadowCacheInterval,
+			FarShadowCache::kMinInterval, FarShadowCache::kMaxInterval))
+		FarShadowCache::SetInterval(farShadowCacheInterval);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T("menu.advanced.far_shadow_cache_interval_tooltip",
+							  "Reuses the far directional shadow cascade (Cascade 1) for up to N frames while keeping near shadows (Cascade 0) at full frame rate.\n"
+							  "1 renders every frame (vanilla). Automatically refreshes on camera movement/turn, sun change, or cell change."));
 	}
 
 	ImGui::Spacing();

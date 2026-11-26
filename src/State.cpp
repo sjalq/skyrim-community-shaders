@@ -6,6 +6,7 @@
 
 #include "ConstantBufferRing.h"
 #include "Deferred.h"
+#include "EngineFixes/ShadowmapCascadeRasterizerFix.h"
 #include "FeatureIssues.h"
 #include "Features/CSEditor.h"
 #include "Features/CloudShadows.h"
@@ -115,6 +116,8 @@ void State::Draw()
 		}
 
 		if (skin.loaded) {
+			if (currentShader && currentShader->shaderType.get() != RE::BSShader::Type::Lighting)
+				skin.perGeometryCBBound = false;
 			ZoneScopedN("Skin::SetShaderResources");
 			skin.SetShaderResources(context);
 		}
@@ -539,6 +542,7 @@ void State::SaveToJson(nlohmann::json& settings)
 	advanced["Partial Precision"] = enablePartialPrecision.load(std::memory_order_relaxed);
 	advanced["Constant Buffer Ring"] = ConstantBufferRing::IsEnabled();
 	advanced["Reflection Cubemap Interval"] = ReflectionCubemap::GetInterval();
+	advanced["Far Shadow Cache Interval"] = FarShadowCache::GetInterval();
 	settings["Advanced"] = advanced;
 
 	json general;
@@ -622,6 +626,8 @@ void State::LoadFromJson(nlohmann::json& settings)
 			ConstantBufferRing::SetEnabled(advanced["Constant Buffer Ring"].get<bool>());
 		if (advanced.contains("Reflection Cubemap Interval") && advanced["Reflection Cubemap Interval"].is_number_integer())
 			ReflectionCubemap::SetInterval(advanced["Reflection Cubemap Interval"].get<int>());
+		if (advanced.contains("Far Shadow Cache Interval") && advanced["Far Shadow Cache Interval"].is_number_integer())
+			FarShadowCache::SetInterval(advanced["Far Shadow Cache Interval"].get<int>());
 	}
 
 	if (settings.contains("General") && settings["General"].is_object()) {

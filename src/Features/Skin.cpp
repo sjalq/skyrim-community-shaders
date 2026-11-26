@@ -233,6 +233,7 @@ void Skin::ReloadSkinDetail()
 
 void Skin::Prepass()
 {
+	perGeometryCBBound = false;
 	auto context = globals::d3d::context;
 
 	if (texSkinDetail) {
@@ -333,11 +334,23 @@ float Skin::GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a
 float4 Skin::GetWetness(RE::BSGeometry* geometry)
 {
 	float4 wetness = float4(0.0f, 0.0f, 0.0f, 0.0f);
-	auto userData = geometry->GetUserData();
+	const uint currentFrame = globals::state->frameCount;
+	RE::TESObjectREFR* userData = geometry->userData;
+	if (!userData) {
+		if (auto* parent = geometry->parent) {
+			const size_t slot = (reinterpret_cast<uintptr_t>(parent) >> 6) & (parentUserDataCache.size() - 1);
+			auto& entry = parentUserDataCache[slot];
+			if (entry.frame == currentFrame && entry.parent == parent) {
+				userData = entry.userData;
+			} else {
+				userData = parent->GetUserData();
+				entry = { parent, userData, currentFrame };
+			}
+		}
+	}
 	if (userData && userData->formType == RE::FormType::ActorCharacter) {
 		auto actor = static_cast<RE::Character*>(userData);
 		const uint32_t actorFormID = userData->formID;
-		const uint currentFrame = globals::state->frameCount;
 
 		if (actorWetnessMap.size() > 1024) {
 			actorWetnessMap.clear();
@@ -570,12 +583,11 @@ void Skin::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const
 
 void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 {
-	auto context = globals::d3d::context;
-
 	if (settings.EnableSkin) {
 		auto geometry = a_pass->geometry;
 		float4 wetness = GetWetness(geometry);
 
+		bool updated = false;
 		if (currentWetness != wetness) {
 			currentWetness = wetness;
 			PerGeometryData perGeometryData{};
@@ -583,10 +595,14 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			// Per draw, so through the constant buffer ring while it is active (no DXVK buffer rename per change).
 			if (!ConstantBufferRing::PublishOwned(PerGeometryCB->CB(), &perGeometryData, sizeof(perGeometryData)))
 				PerGeometryCB->Update(perGeometryData);
+			updated = true;
 		}
 
-		ID3D11Buffer* buffer = { PerGeometryCB->CB() };
-		context->PSSetConstantBuffers(7, 1, &buffer);
+		if (updated || !perGeometryCBBound) {
+			ID3D11Buffer* buffer = { PerGeometryCB->CB() };
+			globals::d3d::context->PSSetConstantBuffers(7, 1, &buffer);
+			perGeometryCBBound = true;
+		}
 	}
 }
 

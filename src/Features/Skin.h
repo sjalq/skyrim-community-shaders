@@ -119,9 +119,18 @@ struct Skin : Feature
 		uint frameCount = 0;
 	};
 
+	struct ParentUserDataCacheEntry
+	{
+		const RE::NiNode* parent = nullptr;
+		RE::TESObjectREFR* userData = nullptr;
+		uint32_t frame = 0xFFFFFFFFu;
+	};
+
 	eastl::unique_ptr<Texture2D> texSkinDetail = nullptr;
 	std::unordered_map<uint32_t, ExtraTextures> skinExtraTextures;
 	std::unordered_map<uint32_t, ActorWetnessCacheEntry> actorWetnessMap;  // keyed by actor formID
+	std::array<ParentUserDataCacheEntry, 256> parentUserDataCache{};
+	bool perGeometryCBBound = false;
 
 	/** @brief Packs current skin settings into a GPU constant buffer data structure. */
 	SkinData GetCommonBufferData();

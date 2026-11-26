@@ -36,6 +36,8 @@ public:
 
 	std::shared_mutex extendedSlotsMutex;
 	std::unordered_map<uint32_t, ExtendedSlots> extendedSlots;
+	std::atomic<uint32_t> landscapeVtableCount{ 0 };
+	std::array<std::atomic<uintptr_t>, 4> landscapeVtables{};
 	RE::BGSTextureSet* defaultLandTexture;
 	bool enabled = false;
 

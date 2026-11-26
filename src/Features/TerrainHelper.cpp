@@ -45,7 +45,32 @@ bool TerrainHelper::TESObjectLAND_SetupMaterial(RE::TESObjectLAND* land)
 		if (geometry != nullptr) {
 			const auto shaderProp = static_cast<RE::BSLightingShaderProperty*>(geometry->GetGeometryRuntimeData().shaderProperty.get());
 			if (shaderProp != nullptr) {
-				hashKey = shaderProp->GetBaseMaterial()->hashKey;
+				if (const auto* baseMat = shaderProp->GetBaseMaterial()) {
+					hashKey = baseMat->hashKey;
+					const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(baseMat);
+					uint32_t count = landscapeVtableCount.load(std::memory_order_acquire);
+					bool known = false;
+					for (uint32_t i = 0; i < count && i < landscapeVtables.size(); ++i) {
+						if (landscapeVtables[i].load(std::memory_order_relaxed) == vt) {
+							known = true;
+							break;
+						}
+					}
+					if (!known && count < landscapeVtables.size()) {
+						const std::unique_lock lock(extendedSlotsMutex);
+						count = landscapeVtableCount.load(std::memory_order_relaxed);
+						for (uint32_t i = 0; i < count && i < landscapeVtables.size(); ++i) {
+							if (landscapeVtables[i].load(std::memory_order_relaxed) == vt) {
+								known = true;
+								break;
+							}
+						}
+						if (!known && count < landscapeVtables.size()) {
+							landscapeVtables[count].store(vt, std::memory_order_relaxed);
+							landscapeVtableCount.store(count + 1, std::memory_order_release);
+						}
+					}
+				}
 			}
 		}
 
@@ -155,13 +180,24 @@ void TerrainHelper::SetShaderResources(ID3D11DeviceContext* a_context)
 
 void TerrainHelper::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const* material)
 {
-	if (!enabled) {
-		// terrain helper is not enabled
+	if (!enabled || material == nullptr) {
 		return;
 	}
 
-	if (material == nullptr) {
-		return;
+	// Fast lock-free reject for non-landscape materials (>99% of BSLightingShader draws).
+	const uint32_t vtCount = landscapeVtableCount.load(std::memory_order_acquire);
+	if (vtCount > 0 && vtCount <= landscapeVtables.size()) {
+		const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(material);
+		bool isLandscape = false;
+		for (uint32_t i = 0; i < vtCount; ++i) {
+			if (landscapeVtables[i].load(std::memory_order_relaxed) == vt) {
+				isLandscape = true;
+				break;
+			}
+		}
+		if (!isLandscape) {
+			return;
+		}
 	}
 
 	// Read the slots in place while holding the shared lock instead of copying ExtendedSlots: the copy
