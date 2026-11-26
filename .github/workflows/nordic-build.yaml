@@ -2,7 +2,8 @@ name: "Nordic: Build Plugin"
 
 # Fork-only build for the nordic-perf branch: builds the plugin + AIO package
 # with the shared build workflow and uploads dist/ as the `dist-artifacts`
-# artifact. No release, upload or notification steps, so no secrets are needed.
+# artifact, plus a small `cs-dll` artifact with just the plugin DLL and PDB.
+# No release, upload or notification steps, so no secrets are needed.
 
 on:
     push:
@@ -44,3 +45,49 @@ jobs:
             run-shader-validation: ${{ github.event_name == 'workflow_dispatch' && inputs.validate-shaders == true }}
             cmake-preset: ${{ inputs.cmake-preset || 'ALL' }}
             cache-key-suffix: ${{ inputs.cache-key-suffix || '' }}
+
+    # dist-artifacts bundles the whole AIO archive, which is slow to download just to swap the
+    # plugin. Unpack it inside GitHub and re-upload only CommunityShaders.dll and .pdb.
+    plugin-dll:
+        name: Extract plugin DLL
+        needs: build
+        runs-on: ubuntu-latest
+        steps:
+            - name: Download dist artifacts
+              uses: actions/download-artifact@v7
+              with:
+                  name: dist-artifacts
+                  path: dist/
+
+            - name: Extract CommunityShaders.dll and .pdb
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  shopt -s nullglob
+                  mkdir -p cs-dll
+                  core=(dist/CommunityShaders-*.zip)
+                  aio=(dist/CommunityShaders_AIO-*.7z dist/CommunityShaders_AIO-*.zip)
+                  if (( ${#core[@]} )); then
+                      # ZIP_TO_DIST builds (the ALL preset) also ship the core zip.
+                      unzip -j -o "${core[0]}" '*SKSE/Plugins/CommunityShaders.dll' '*SKSE/Plugins/CommunityShaders.pdb' -d cs-dll
+                  elif (( ${#aio[@]} )); then
+                      # The PR preset turns ZIP_TO_DIST off, so the AIO archive is the only package.
+                      command -v 7z > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full; }
+                      7z e -y -bd -ocs-dll "${aio[0]}" -r CommunityShaders.dll CommunityShaders.pdb
+                  else
+                      echo "::error::dist-artifacts holds neither CommunityShaders-*.zip nor CommunityShaders_AIO-*"
+                      ls -la dist
+                      exit 1
+                  fi
+                  for file in CommunityShaders.dll CommunityShaders.pdb; do
+                      [ -s "cs-dll/$file" ] || { echo "::error::$file is missing from the package"; exit 1; }
+                  done
+                  ls -l cs-dll
+
+            - name: Upload cs-dll artifact
+              uses: actions/upload-artifact@v7
+              with:
+                  name: cs-dll
+                  path: cs-dll/
+                  retention-days: 7
+                  if-no-files-found: error
