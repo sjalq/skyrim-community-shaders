@@ -21,6 +21,7 @@
 #include "Features/TerrainHelper.h"
 #include "Features/Upscaling.h"
 #include "Features/VolumetricShadows.h"
+#include "InstancingProbe.h"
 #include "Menu.h"
 #include "SceneSettingsManager.h"
 #include "SettingsOverrideManager.h"
@@ -537,6 +538,7 @@ void State::SaveToJson(nlohmann::json& settings)
 	advanced["Partial Precision"] = enablePartialPrecision.load(std::memory_order_relaxed);
 	advanced["Constant Buffer Ring"] = ConstantBufferRing::IsEnabled();
 	advanced["Reflection Cubemap Interval"] = ReflectionCubemap::GetInterval();
+	advanced["Instancing Probe"] = InstancingProbe::IsEnabled();
 	settings["Advanced"] = advanced;
 
 	json general;
@@ -620,6 +622,8 @@ void State::LoadFromJson(nlohmann::json& settings)
 			ConstantBufferRing::SetEnabled(advanced["Constant Buffer Ring"].get<bool>());
 		if (advanced.contains("Reflection Cubemap Interval") && advanced["Reflection Cubemap Interval"].is_number_integer())
 			ReflectionCubemap::SetInterval(advanced["Reflection Cubemap Interval"].get<int>());
+		if (advanced.contains("Instancing Probe") && advanced["Instancing Probe"].is_boolean())
+			InstancingProbe::SetEnabled(advanced["Instancing Probe"].get<bool>());
 	}
 
 	if (settings.contains("General") && settings["General"].is_object()) {

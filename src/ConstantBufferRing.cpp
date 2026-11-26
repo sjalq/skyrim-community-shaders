@@ -813,6 +813,18 @@ namespace ConstantBufferRing
 		}
 	}
 
+	bool PeekLatest(const void* a_buffer, const void*& a_data, UINT& a_bytes)
+	{
+		if (!OnRenderThread() || !g.active.load(std::memory_order_relaxed))
+			return false;
+		const Record* record = Find(a_buffer);
+		if (!record || record->mapped)
+			return false;
+		a_data = record->lastUpload.get();  // latest contents (see Record::lastUpload)
+		a_bytes = record->byteWidth;
+		return true;
+	}
+
 	bool TryMap(ID3D11DeviceContext* a_context, ID3D11Resource* a_resource, UINT a_subresource, D3D11_MAP a_mapType,
 		D3D11_MAPPED_SUBRESOURCE* a_mapped, const void* a_caller)
 	{

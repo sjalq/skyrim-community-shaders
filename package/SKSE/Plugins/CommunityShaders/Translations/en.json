@@ -1818,6 +1818,8 @@
     "menu.advanced.infinite_core_gap_metric": "Infinite-core gap: %.1f%%",
     "menu.advanced.infinite_core_gap_tooltip_1": "Distance from ideal infinite-core time.",
     "menu.advanced.infinite_core_gap_tooltip_2": "Defined as 100 * (1 - S / T_p). Lower is better.",
+    "menu.advanced.instancing_probe": "Instancing Probe",
+    "menu.advanced.instancing_probe_tooltip": "Counts which sun shadow, depth prepass, G-buffer and reflection cubemap draws could be merged into instanced draws, without changing any draw.\nWrites one [InstancingProbe] line per pass type to CommunityShaders.log every 600 frames. Costs main-thread CPU time while on. Takes effect on the next frame.",
     "menu.advanced.log_level": "Log Level",
     "menu.advanced.log_level_critical": "critical",
     "menu.advanced.log_level_debug": "debug",

@@ -14,6 +14,7 @@
 #include "Fonts.h"
 #include "Globals.h"
 #include "I18n/I18n.h"
+#include "InstancingProbe.h"
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
@@ -743,6 +744,18 @@ void AdvancedSettingsRenderer::RenderDeveloperSection()
 							  "and keeps the previous contents otherwise.\n"
 							  "1 updates every time (vanilla). Higher values save GPU and main-thread CPU time; reflections update more slowly.\n"
 							  "Every update still renders for 30 frames after a load, cell change or change of this value. Applies immediately."));
+	}
+
+	// Instancing slice S0 probe: counters only, no draw changes; applied on the next frame, so it toggles live.
+	bool instancingProbe = InstancingProbe::IsEnabled();
+	if (ImGui::Checkbox(T("menu.advanced.instancing_probe", "Instancing Probe"), &instancingProbe))
+		InstancingProbe::SetEnabled(instancingProbe);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T("menu.advanced.instancing_probe_tooltip",
+							  "Counts which sun shadow, depth prepass, G-buffer and reflection cubemap draws could be merged into "
+							  "instanced draws, without changing any draw.\n"
+							  "Writes one [InstancingProbe] line per pass type to CommunityShaders.log every 600 frames. "
+							  "Costs main-thread CPU time while on. Takes effect on the next frame."));
 	}
 
 	ImGui::Spacing();

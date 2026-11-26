@@ -89,6 +89,14 @@ namespace ConstantBufferRing
 	void OnFrameBoundary();
 
 	/**
+	 * @brief Read-only view of the latest contents the ring holds for an engine constant buffer.
+	 *
+	 * Valid until the engine maps that buffer again. Fails off the render thread, while the ring is
+	 * inactive, for buffers the ring does not manage, and while the buffer is mapped.
+	 */
+	[[nodiscard]] bool PeekLatest(const void* a_buffer, const void*& a_data, UINT& a_bytes);
+
+	/**
 	 * @brief Map interception, called first by the Map hook.
 	 * @param a_caller Return address of the Map call, used to recognise calls from the game executable.
 	 * @return True when the map was redirected to a shadow copy; the hook then returns S_OK.

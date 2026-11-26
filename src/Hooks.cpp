@@ -8,6 +8,7 @@
 #include "ConstantBufferRing.h"
 #include "Feature.h"
 #include "Globals.h"
+#include "InstancingProbe.h"
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
@@ -385,6 +386,7 @@ struct IDXGISwapChain_Present
 	{
 		// No engine constant buffer is mapped between frames, so ring toggles are applied here.
 		ConstantBufferRing::OnFrameBoundary();
+		InstancingProbe::OnFrameBoundary();
 
 		globals::state->Reset();
 

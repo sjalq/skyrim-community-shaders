@@ -1,6 +1,7 @@
 #include "Deferred.h"
 #include "Features/Upscaling.h"
 #include "FrameAnnotations.h"
+#include "InstancingProbe.h"
 #include "Globals.h"
 #include "Hooks.h"
 #include "I18n/I18n.h"
@@ -54,7 +55,7 @@ extern "C" DLLEXPORT bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadInterface* a_s
 	InitializeLog();
 	logger::info("Loaded {} {}", Plugin::NAME, Plugin::VERSION.string());
 	SKSE::Init(a_skse);
-	SKSE::AllocTrampoline(1 << 10);
+	SKSE::AllocTrampoline(1 << 11);
 	return Load();
 }
 
@@ -90,6 +91,9 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 
 				// Run feature PostPostLoad() first so features can disable themselves if needed
 				Feature::ForEachLoadedFeature("PostPostLoad", [](Feature* feature) { feature->PostPostLoad(); });
+
+				// After every feature hook so the probe's thunks are outermost on shared call sites.
+				InstancingProbe::Install();
 
 				// Register scene settings event handler (Interior Only transitions)
 				SceneSettingsManager::MenuOpenCloseEventHandler::Register();

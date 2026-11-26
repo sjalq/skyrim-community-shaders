@@ -43,6 +43,7 @@
 #include "Features/VolumetricShadows.h"
 #include "Features/WaterEffects.h"
 #include "Features/WetnessEffects.h"
+#include "InstancingProbe.h"
 #include "Menu.h"
 #include "SceneSettingsManager.h"
 #include "ShaderCache.h"
@@ -330,5 +331,7 @@ namespace globals
 			ConstantBufferRing::Install(d3d::device, a_context, ID3D11DeviceContext_Map::func.get(), ID3D11DeviceContext_Unmap::func.get());
 		else
 			logger::error("[CB Ring] Unavailable: the Map/Unmap hooks are not live; engine constant buffers stay on WRITE_DISCARD");
+
+		InstancingProbe::InstallD3DHooks(a_context);
 	}
 }
