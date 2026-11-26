@@ -1,8 +1,9 @@
 #include "CloudShadows.h"
 
-#include "Effects11.h"
-#include "Effects11/SettingManager.h"
 #include "../I18n/I18n.h"
+#include "Effects11.h"
+#include "Effects11/EffectManager.h"
+#include "Effects11/SettingManager.h"
 #include "Globals.h"
 #include "State.h"
 #include "Utils/D3D.h"
@@ -58,8 +59,9 @@ CloudShadows::Settings CloudShadows::GetCommonBufferData()
 		auto& enb = globals::features::effects11;
 		if (enb.enableEffect) {
 			auto& settingManager = SettingManager::GetSingleton();
-			if (settingManager.GetValue<bool>("EnableCloudShadows", "EFFECT")) {
-				data.Opacity = settingManager.GetInterpolatedTimeOfDayValue("Amount", "CLOUDSHADOWS");
+			const auto& settingIDs = EffectManager::GetSingleton().ids;
+			if (settingManager.GetValue<bool>(settingIDs.enableCloudShadows)) {
+				data.Opacity = settingManager.GetInterpolatedTimeOfDayValue(settingIDs.cloudShadowsAmount);
 			} else {
 				data.Opacity = 0.0f;
 			}

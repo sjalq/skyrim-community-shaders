@@ -196,7 +196,6 @@ T SettingManager::GetValueInternal(uint32_t id, bool rawValue) const
 	}
 
 	const auto& setting = allSettings[id];
-	const auto& categorySettings = categories.at(setting.category);
 
 	auto safeGet = [](const SettingValue& v) -> T {
 		if (auto* p = std::get_if<T>(&v))
@@ -205,6 +204,9 @@ T SettingManager::GetValueInternal(uint32_t id, bool rawValue) const
 	};
 
 	if (setting.hasWeatherSupport) {
+		// Only weather-aware settings need their category's ignore flags; registration always creates
+		// the category, so looking it up here instead of for every setting cannot change the result.
+		const auto& categorySettings = categories.at(setting.category);
 		bool isInterior = (timeOfDay2[2] + timeOfDay2[3]) > 0.5f;
 		bool shouldIgnoreWeather = isInterior ?
 		                               categorySettings.ignoreWeatherSystemInterior :
@@ -339,6 +341,24 @@ float3 SettingManager::GetInterpolatedColorTimeOfDayValue(const std::string& key
 	uint32_t id = GetSettingIDInternal(key, category);
 	if (id == 0xFFFFFFFF)
 		return {};
+	ColorTimeOfDayValue colorTimeOfDayValue = GetValueInternal<ColorTimeOfDayValue>(id);
+	return ComputeColorTimeOfDayInterpolation(colorTimeOfDayValue);
+}
+
+float SettingManager::GetInterpolatedTimeOfDayValue(uint32_t id)
+{
+	if (id == 0xFFFFFFFF)
+		return 0.0f;
+	std::shared_lock lock(mutex);
+	TimeOfDayValue timeOfDayValue = GetValueInternal<TimeOfDayValue>(id);
+	return ComputeTimeOfDayInterpolation(timeOfDayValue);
+}
+
+float3 SettingManager::GetInterpolatedColorTimeOfDayValue(uint32_t id)
+{
+	if (id == 0xFFFFFFFF)
+		return {};
+	std::shared_lock lock(mutex);
 	ColorTimeOfDayValue colorTimeOfDayValue = GetValueInternal<ColorTimeOfDayValue>(id);
 	return ComputeColorTimeOfDayInterpolation(colorTimeOfDayValue);
 }

@@ -312,6 +312,14 @@ void EffectManager::RegisterSettings()
 
 	ids.brightness = settingManager.GetSettingID("Brightness", "COLORCORRECTION");
 	ids.gammaCurve = settingManager.GetSettingID("GammaCurve", "COLORCORRECTION");
+
+	ids.pointLightingCurve = settingManager.GetSettingID("PointLightingCurve", "ENVIRONMENT");
+	ids.pointLightingDesaturation = settingManager.GetSettingID("PointLightingDesaturation", "ENVIRONMENT");
+	ids.pointLightingIntensity = settingManager.GetSettingID("PointLightingIntensity", "ENVIRONMENT");
+	ids.ambientLightingDesaturation = settingManager.GetSettingID("AmbientLightingDesaturation", "ENVIRONMENT");
+	ids.ambientLightingIntensity = settingManager.GetSettingID("AmbientLightingIntensity", "ENVIRONMENT");
+	ids.enableCloudShadows = settingManager.GetSettingID("EnableCloudShadows", "EFFECT");
+	ids.cloudShadowsAmount = settingManager.GetSettingID("Amount", "CLOUDSHADOWS");
 }
 
 void EffectManager::ExecuteEffect(EffectBase& a_effect, uint32_t enableSettingID)

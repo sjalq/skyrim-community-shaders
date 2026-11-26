@@ -489,16 +489,19 @@ void Effects11::CheckCommonData()
 
 void Effects11::OverridePointLightColor(float3& a_color)
 {
+	// Runs for every light every frame: read through the IDs cached at registration, not the key overloads.
 	auto& settingManager = SettingManager::GetSingleton();
+	const auto& settingIDs = EffectManager::GetSingleton().ids;
 
-	a_color = Curve(a_color, settingManager.GetInterpolatedTimeOfDayValue("PointLightingCurve", "ENVIRONMENT"));
-	a_color = Desaturation(a_color, settingManager.GetInterpolatedTimeOfDayValue("PointLightingDesaturation", "ENVIRONMENT"));
-	a_color = Intensity(a_color, settingManager.GetInterpolatedTimeOfDayValue("PointLightingIntensity", "ENVIRONMENT"));
+	a_color = Curve(a_color, settingManager.GetInterpolatedTimeOfDayValue(settingIDs.pointLightingCurve));
+	a_color = Desaturation(a_color, settingManager.GetInterpolatedTimeOfDayValue(settingIDs.pointLightingDesaturation));
+	a_color = Intensity(a_color, settingManager.GetInterpolatedTimeOfDayValue(settingIDs.pointLightingIntensity));
 }
 
 void Effects11::OverrideAmbientLighting(DirectionalAmbientColors& DirectionalAmbientColors)
 {
 	auto& settingManager = SettingManager::GetSingleton();
+	const auto& settingIDs = EffectManager::GetSingleton().ids;
 
 	for (int i = 0; i < 3; i++) {
 		for (int j = 0; j < 2; j++) {
@@ -508,9 +511,9 @@ void Effects11::OverrideAmbientLighting(DirectionalAmbientColors& DirectionalAmb
 
 			int currentSide = i * 2 + j;
 			if (currentSide == 3)
-				ambientLightingColorF3 = Desaturation(ambientLightingColorF3, settingManager.GetInterpolatedTimeOfDayValue("AmbientLightingDesaturation", "ENVIRONMENT"));
+				ambientLightingColorF3 = Desaturation(ambientLightingColorF3, settingManager.GetInterpolatedTimeOfDayValue(settingIDs.ambientLightingDesaturation));
 
-			ambientLightingColorF3 = Intensity(ambientLightingColorF3, settingManager.GetInterpolatedTimeOfDayValue("AmbientLightingIntensity", "ENVIRONMENT"));
+			ambientLightingColorF3 = Intensity(ambientLightingColorF3, settingManager.GetInterpolatedTimeOfDayValue(settingIDs.ambientLightingIntensity));
 
 			ambientLightingColor = F3ToNi(ambientLightingColorF3);
 		}

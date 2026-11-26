@@ -122,6 +122,15 @@ public:
 
 		uint32_t brightness = 0xFFFFFFFF;
 		uint32_t gammaCurve = 0xFFFFFFFF;
+
+		// Read per light / per pass (Effects11 light and ambient overrides, cloud shadow opacity).
+		uint32_t pointLightingCurve = 0xFFFFFFFF;
+		uint32_t pointLightingDesaturation = 0xFFFFFFFF;
+		uint32_t pointLightingIntensity = 0xFFFFFFFF;
+		uint32_t ambientLightingDesaturation = 0xFFFFFFFF;
+		uint32_t ambientLightingIntensity = 0xFFFFFFFF;
+		uint32_t enableCloudShadows = 0xFFFFFFFF;
+		uint32_t cloudShadowsAmount = 0xFFFFFFFF;
 	} ids;
 
 	const CommonVariableData& GetCommonData() const { return commonData; }

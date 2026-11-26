@@ -139,6 +139,12 @@ public:
 	float GetInterpolatedTimeOfDayValue(const std::string& key, const std::string& category);
 	float3 GetInterpolatedColorTimeOfDayValue(const std::string& key, const std::string& category);
 
+	// ID overloads for hot paths (per light, per pass): same results as the key overloads, including
+	// 0 for an unregistered setting (ID 0xFFFFFFFF), without building and hashing two std::string keys
+	// per call. IDs come from GetSettingID and stay valid because settings are never unregistered.
+	float GetInterpolatedTimeOfDayValue(uint32_t id);
+	float3 GetInterpolatedColorTimeOfDayValue(uint32_t id);
+
 	const Setting* GetSettingInfo(const std::string& key, const std::string& category) const;
 	std::vector<std::string> GetSettingsByCategory(const std::string& category) const;
 	bool CategoryHasWeatherSupport(const std::string& category) const;
