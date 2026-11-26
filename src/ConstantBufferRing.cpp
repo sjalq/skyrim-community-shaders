@@ -18,7 +18,7 @@ namespace ConstantBufferRing
 		constexpr UINT kAlignmentBytes = 256;
 		// Largest engine buffer taken over: the most a single binding can expose (4096 constants).
 		constexpr UINT kMaxManagedBytes = kMaxWindowConstants * kConstantBytes;
-		constexpr UINT kRingBytes = 8u << 20;
+		constexpr UINT kRingBytes = 32u << 20;
 		constexpr UINT kInvalid = UINT_MAX;
 		// Frames after activation at which the redirection statistics are logged once.
 		constexpr uint32_t kStatsLogFrame = 600;
@@ -57,6 +57,7 @@ namespace ConstantBufferRing
 		{
 			ID3D11Buffer* buffer = nullptr;         // one reference is held so the address cannot be reused
 			std::unique_ptr<ShadowBlock[]> shadow;  // latest contents; the engine writes here between Map and Unmap
+			std::unique_ptr<ShadowBlock[]> lastUpload;  // byteWidth bytes of the latest upload, to skip unchanged ones
 			UINT byteWidth = 0;
 			UINT allocBytes = 0;                             // byteWidth rounded up to kAlignmentBytes
 			UINT numConstants = 0;                           // allocBytes / 16, so a multiple of 16 and at most 4096
@@ -95,11 +96,13 @@ namespace ConstantBufferRing
 			bool disabledForSession = false;
 			bool uploadFailed = false;
 			bool warnedThread = false;
+			bool persistentMapping = false;  // DXVK: uploads write through ringData (see Wrap)
 			std::atomic_bool active{ false };
 			std::atomic_bool requested{ true };
 
 			UINT cursor = kRingBytes;  // forces a discard before the first upload
 			uint32_t generation = 0;
+			std::byte* ringData = nullptr;  // pointer the latest discard returned while persistentMapping is on
 
 			std::vector<std::unique_ptr<Record>> records;
 			ankerl::unordered_dense::map<const void*, Record*> managed;
@@ -109,7 +112,9 @@ namespace ConstantBufferRing
 
 			uint32_t uploadsThisFrame = 0;
 			uint32_t uploadsLastFrame = 0;
+			uint32_t dedupedThisFrame = 0;
 			uint64_t uploadsSinceActivation = 0;
+			uint64_t dedupedSinceActivation = 0;
 			uint64_t wrapsSinceActivation = 0;
 			uint32_t framesSinceActivation = 0;
 			bool loggedStats = false;
@@ -134,6 +139,18 @@ namespace ConstantBufferRing
 		[[nodiscard]] bool IsEngineCode(const void* a_address)
 		{
 			return reinterpret_cast<std::uintptr_t>(a_address) - g.engineTextBegin < g.engineTextSize;
+		}
+
+		/** @brief True on DXVK, recognised by its ID3D11VkExtDevice interface, which native drivers do not implement. */
+		[[nodiscard]] bool IsDXVK(ID3D11Device* a_device)
+		{
+			// IID of ID3D11VkExtDevice, from DXVK's src/d3d11/d3d11_interfaces.h.
+			constexpr GUID kVkExtDeviceIID{ 0x8a6e3c42, 0xf74c, 0x45b7, { 0x82, 0x65, 0xa2, 0x31, 0xb6, 0x77, 0xca, 0x17 } };
+			void* extension = nullptr;
+			if (FAILED(a_device->QueryInterface(kVkExtDeviceIID, &extension)) || !extension)
+				return false;
+			static_cast<IUnknown*>(extension)->Release();
+			return true;
 		}
 
 		[[nodiscard]] Record* Find(const void* a_resource)
@@ -192,18 +209,23 @@ namespace ConstantBufferRing
 				g.uploadFailed = true;
 				return;
 			}
-			D3D11_MAPPED_SUBRESOURCE mapped{};
-			if (FAILED(g.map(g.context, g.ring.get(), 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped))) {
-				g.uploadFailed = true;
-				return;
+			if (g.ringData) {
+				std::memcpy(g.ringData + g.cursor, a_record.shadow.get(), a_record.byteWidth);
+			} else {
+				D3D11_MAPPED_SUBRESOURCE mapped{};
+				if (FAILED(g.map(g.context, g.ring.get(), 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped))) {
+					g.uploadFailed = true;
+					return;
+				}
+				if (mapped.pData)
+					std::memcpy(static_cast<std::byte*>(mapped.pData) + g.cursor, a_record.shadow.get(), a_record.byteWidth);
+				g.unmap(g.context, g.ring.get(), 0);
+				if (!mapped.pData) {
+					g.uploadFailed = true;
+					return;
+				}
 			}
-			if (mapped.pData)
-				std::memcpy(static_cast<std::byte*>(mapped.pData) + g.cursor, a_record.shadow.get(), a_record.byteWidth);
-			g.unmap(g.context, g.ring.get(), 0);
-			if (!mapped.pData) {
-				g.uploadFailed = true;
-				return;
-			}
+			std::memcpy(a_record.lastUpload.get(), a_record.shadow.get(), a_record.byteWidth);
 			a_record.firstConstant = g.cursor / kConstantBytes;
 			a_record.generation = g.generation;
 			g.cursor += a_record.allocBytes;
@@ -215,9 +237,14 @@ namespace ConstantBufferRing
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped{};
 			if (FAILED(g.map(g.context, g.ring.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+				g.ringData = nullptr;
 				g.uploadFailed = true;
 				return;
 			}
+			// DXVK's buffer Unmap does nothing and its Map(WRITE_NO_OVERWRITE) returns the pointer of the latest
+			// discard, so until the next wrap uploads write through this pointer instead of mapping per upload.
+			// The ring is still unmapped right away, so no draw ever uses it while it is mapped.
+			g.ringData = g.persistentMapping ? static_cast<std::byte*>(mapped.pData) : nullptr;
 			g.unmap(g.context, g.ring.get(), 0);
 			g.cursor = 0;
 			if (++g.generation == 0)
@@ -319,6 +346,7 @@ namespace ConstantBufferRing
 			record->allocBytes = (desc.ByteWidth + kAlignmentBytes - 1) & ~(kAlignmentBytes - 1);
 			record->numConstants = record->allocBytes / kConstantBytes;
 			record->shadow = std::make_unique<ShadowBlock[]>(record->allocBytes / sizeof(ShadowBlock));
+			record->lastUpload = std::make_unique<ShadowBlock[]>(record->allocBytes / sizeof(ShadowBlock));
 			buffer->AddRef();
 			record->buffer = buffer;
 
@@ -357,8 +385,10 @@ namespace ConstantBufferRing
 				}
 			}
 			g.cursor = kRingBytes;  // the first upload discards, so no earlier storage is reused under NO_OVERWRITE
+			g.ringData = nullptr;
 			g.uploadFailed = false;
 			g.uploadsSinceActivation = 0;
+			g.dedupedSinceActivation = 0;
 			g.wrapsSinceActivation = 0;
 			g.framesSinceActivation = 0;
 			g.active.store(true, std::memory_order_relaxed);
@@ -397,6 +427,7 @@ namespace ConstantBufferRing
 			g.records.clear();
 			g.managed.clear();
 			g.mappedCount = 0;
+			g.ringData = nullptr;
 			g.active.store(false, std::memory_order_relaxed);
 			logger::info("[CB Ring] Engine constant buffer ring off ({})", a_reason);
 		}
@@ -680,9 +711,11 @@ namespace ConstantBufferRing
 			return;
 		}
 
+		g.persistentMapping = IsDXVK(a_device);
 		g.supported = true;
-		logger::info("[CB Ring] {} MiB engine constant buffer ring ready (ConstantBufferOffsetting, MapNoOverwriteOnDynamicConstantBuffer); {} by the \"Constant Buffer Ring\" setting",
-			kRingBytes >> 20, g.requested.load(std::memory_order_relaxed) ? "enabled" : "disabled");
+		logger::info("[CB Ring] {} MiB engine constant buffer ring ready (ConstantBufferOffsetting, MapNoOverwriteOnDynamicConstantBuffer{}); {} by the \"Constant Buffer Ring\" setting",
+			kRingBytes >> 20, g.persistentMapping ? ", DXVK: uploads write through the pointer of each ring discard" : "",
+			g.requested.load(std::memory_order_relaxed) ? "enabled" : "disabled");
 	}
 
 	void SetEnabled(bool a_enabled)
@@ -722,6 +755,7 @@ namespace ConstantBufferRing
 
 		g.uploadsLastFrame = std::exchange(g.uploadsThisFrame, 0);
 		g.uploadsSinceActivation += g.uploadsLastFrame;
+		g.dedupedSinceActivation += std::exchange(g.dedupedThisFrame, 0);
 
 		if (g.uploadFailed && g.active.load(std::memory_order_relaxed))
 			DisableForSession("a ring map failed");
@@ -735,8 +769,9 @@ namespace ConstantBufferRing
 
 		if (g.active.load(std::memory_order_relaxed) && !g.loggedStats && ++g.framesSinceActivation == kStatsLogFrame) {
 			g.loggedStats = true;
-			logger::info("[CB Ring] After {} frames: {} engine constant buffers on the ring, {:.0f} uploads per frame, {} ring wraps",
-				kStatsLogFrame, g.records.size(), static_cast<double>(g.uploadsSinceActivation) / kStatsLogFrame, g.wrapsSinceActivation);
+			logger::info("[CB Ring] After {} frames: {} engine constant buffers on the ring, {:.0f} uploads per frame, {:.0f} unchanged uploads skipped per frame, {} ring wraps",
+				kStatsLogFrame, g.records.size(), static_cast<double>(g.uploadsSinceActivation) / kStatsLogFrame,
+				static_cast<double>(g.dedupedSinceActivation) / kStatsLogFrame, g.wrapsSinceActivation);
 		}
 	}
 
@@ -780,11 +815,17 @@ namespace ConstantBufferRing
 		if (Record* record = Find(a_resource); record && record->mapped) {
 			record->mapped = false;
 			--g.mappedCount;
-			Upload(*record);
-			if (g.uploadFailed) {
-				// Deactivation writes the shadow into the engine buffer itself, so this update still lands.
-				DisableForSession("a ring map failed");
-				return true;
+			// Contents equal to the latest upload, whose range no wrap has discarded since, reuse that range.
+			if (record->generation != 0 && record->generation == g.generation &&
+				std::memcmp(record->shadow.get(), record->lastUpload.get(), record->byteWidth) == 0) {
+				++g.dedupedThisFrame;
+			} else {
+				Upload(*record);
+				if (g.uploadFailed) {
+					// Deactivation writes the shadow into the engine buffer itself, so this update still lands.
+					DisableForSession("a ring map failed");
+					return true;
+				}
 			}
 			RebindRecord(*record);
 			return true;
