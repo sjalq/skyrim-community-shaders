@@ -77,7 +77,8 @@ void OnDataLoaded();
 void OnGameWindowClose();
 
 /**
- * @brief Installs Detours hooks on the device context's Map/Unmap vtable slots to capture per-frame constant buffer data.
+ * @brief Installs Detours hooks on the device context's Map/Unmap vtable slots to capture per-frame constant buffer data,
+ * then installs the engine constant buffer ring (see ConstantBufferRing.h).
  * @param a_context The D3D11 device context to hook.
  */
 void InstallD3DHooks(ID3D11DeviceContext* a_context);
@@ -260,7 +261,8 @@ namespace globals
 	/** @brief Signals shader compilation to stop when the game window is closing. */
 	void OnGameWindowClose();
 	/**
-	 * @brief Installs Detours hooks on the device context's Map/Unmap vtable slots to capture per-frame constant buffer data.
+	 * @brief Installs Detours hooks on the device context's Map/Unmap vtable slots to capture per-frame constant buffer data,
+	 * then installs the engine constant buffer ring (see ConstantBufferRing.h).
 	 * @param a_context The D3D11 device context to hook.
 	 */
 	void InstallD3DHooks(ID3D11DeviceContext* a_context);

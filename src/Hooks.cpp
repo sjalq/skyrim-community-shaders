@@ -5,6 +5,7 @@
 #include "Utils/ExternalEmittance.h"
 #include "Utils/VersionedRelocation.h"
 
+#include "ConstantBufferRing.h"
 #include "Feature.h"
 #include "Globals.h"
 #include "Menu.h"
@@ -382,6 +383,9 @@ struct IDXGISwapChain_Present
 {
 	static HRESULT WINAPI thunk(IDXGISwapChain* This, UINT SyncInterval, UINT Flags)
 	{
+		// No engine constant buffer is mapped between frames, so ring toggles are applied here.
+		ConstantBufferRing::OnFrameBoundary();
+
 		globals::state->Reset();
 
 		HRESULT retval = globals::features::hdrDisplay.HandleSwapChainPresent(

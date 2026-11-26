@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "CSEditor/EditorWindow.h"
+#include "ConstantBufferRing.h"
 #include "FeatureIssues.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Fonts.h"
@@ -708,6 +709,27 @@ void AdvancedSettingsRenderer::RenderDeveloperSection()
 							  "Resets every launch. Toggling this clears the shader cache and triggers a "
 							  "full recompile."));
 	}
+
+	// Engine constant buffer ring (main-thread CPU saving); applied on the next frame, so it A/B tests live.
+	bool constantBufferRing = ConstantBufferRing::IsEnabled();
+	if (ImGui::Checkbox(T("menu.advanced.constant_buffer_ring", "Constant Buffer Ring"), &constantBufferRing))
+		ConstantBufferRing::SetEnabled(constantBufferRing);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T("menu.advanced.constant_buffer_ring_tooltip",
+							  "Writes the game's per-draw constant buffer updates into one large ring buffer "
+							  "instead of discarding and renaming each buffer on every update.\n"
+							  "Saves main-thread CPU time, most of all under DXVK. Takes effect on the next frame, "
+							  "so it can be toggled to compare."));
+	}
+	const auto ringStatus = ConstantBufferRing::GetStatus();
+	ImGui::SameLine();
+	if (!ringStatus.supported)
+		ImGui::TextDisabled("%s", T("menu.advanced.constant_buffer_ring_unavailable", "(unavailable)"));
+	else if (ringStatus.active)
+		ImGui::TextDisabled(T("menu.advanced.constant_buffer_ring_active", "(active: %u buffers, %u uploads/frame)"),
+			ringStatus.managedBuffers, ringStatus.uploadsLastFrame);
+	else
+		ImGui::TextDisabled("%s", T("menu.advanced.constant_buffer_ring_inactive", "(inactive)"));
 
 	ImGui::Spacing();
 	ImGui::Separator();

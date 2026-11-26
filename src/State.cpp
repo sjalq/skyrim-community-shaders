@@ -4,6 +4,7 @@
 
 #include <pystring/pystring.h>
 
+#include "ConstantBufferRing.h"
 #include "Deferred.h"
 #include "FeatureIssues.h"
 #include "Features/CSEditor.h"
@@ -534,6 +535,7 @@ void State::SaveToJson(nlohmann::json& settings)
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Partial Precision"] = enablePartialPrecision.load(std::memory_order_relaxed);
+	advanced["Constant Buffer Ring"] = ConstantBufferRing::IsEnabled();
 	settings["Advanced"] = advanced;
 
 	json general;
@@ -613,6 +615,8 @@ void State::LoadFromJson(nlohmann::json& settings)
 			frameAnnotations = advanced["Frame Annotations"];
 		if (advanced.contains("Partial Precision") && advanced["Partial Precision"].is_boolean())
 			enablePartialPrecision.store(advanced["Partial Precision"].get<bool>(), std::memory_order_relaxed);
+		if (advanced.contains("Constant Buffer Ring") && advanced["Constant Buffer Ring"].is_boolean())
+			ConstantBufferRing::SetEnabled(advanced["Constant Buffer Ring"].get<bool>());
 	}
 
 	if (settings.contains("General") && settings["General"].is_object()) {

@@ -1,6 +1,10 @@
 #include "Globals.h"
 
+#include <intrin.h>
+
+#include "ConstantBufferRing.h"
 #include "Deferred.h"
+#include "Features/CSEditor.h"
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
 #include "Features/Effects11.h"
@@ -38,7 +42,6 @@
 #include "Features/VolumetricLighting.h"
 #include "Features/VolumetricShadows.h"
 #include "Features/WaterEffects.h"
-#include "Features/CSEditor.h"
 #include "Features/WetnessEffects.h"
 #include "Menu.h"
 #include "SceneSettingsManager.h"
@@ -269,14 +272,21 @@ namespace globals
 	/**
  * @brief Hooks the ID3D11DeviceContext::Map method to track mapping of the per-frame resource.
  *
- * Calls the original Map function and, if the mapped resource matches the current per-frame buffer, stores the mapped subresource pointer for later use.
+ * Engine constant buffer updates are first offered to the constant buffer ring, which redirects them to a
+ * shadow copy (see ConstantBufferRing.h). Otherwise calls the original Map function and, if the mapped
+ * resource matches the current per-frame buffer, stores the mapped subresource pointer for later use.
  *
- * @return HRESULT Result of the original Map call.
+ * @return HRESULT Result of the original Map call, or S_OK for a redirected map.
  */
 	struct ID3D11DeviceContext_Map
 	{
 		static HRESULT thunk(ID3D11DeviceContext* This, ID3D11Resource* pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
 		{
+			// The detour enters this thunk with a jump, so the return address is the caller's: the ring
+			// uses it to recognise maps issued by the game executable.
+			if (ConstantBufferRing::TryMap(This, pResource, Subresource, MapType, pMappedResource, _ReturnAddress()))
+				return S_OK;
+
 			HRESULT hr = func(This, pResource, Subresource, MapType, MapFlags, pMappedResource);
 			if (hr == S_OK) {
 				if (*globals::game::perFrame.get() == pResource)
@@ -290,12 +300,18 @@ namespace globals
 	/**
  * @brief Hooked implementation of ID3D11DeviceContext::Unmap that caches the frame buffer if applicable.
  *
- * If the resource being unmapped matches the current per-frame buffer and a mapped frame buffer is present, caches the frame buffer data before calling the original Unmap function.
+ * An Unmap that completes a map redirected by the constant buffer ring publishes the shadow copy and
+ * skips the original Unmap (the engine buffer itself was never mapped). Otherwise, if the resource being
+ * unmapped matches the current per-frame buffer and a mapped frame buffer is present, caches the frame
+ * buffer data before calling the original Unmap function.
  */
 	struct ID3D11DeviceContext_Unmap
 	{
 		static void thunk(ID3D11DeviceContext* This, ID3D11Resource* pResource, UINT Subresource)
 		{
+			if (ConstantBufferRing::TryUnmap(This, pResource, Subresource))
+				return;
+
 			if (*globals::game::perFrame.get() == pResource && globals::game::mappedFrameBuffer) {
 				CacheFramebuffer();
 			}
@@ -306,7 +322,13 @@ namespace globals
 
 	void InstallD3DHooks(ID3D11DeviceContext* a_context)
 	{
-		stl::detour_vfunc<14, ID3D11DeviceContext_Map>(a_context);
-		stl::detour_vfunc<15, ID3D11DeviceContext_Unmap>(a_context);
+		const bool mapHooked = ConstantBufferRing::DetourVFunc<14, ID3D11DeviceContext_Map>(a_context);
+		const bool unmapHooked = ConstantBufferRing::DetourVFunc<15, ID3D11DeviceContext_Unmap>(a_context);
+
+		// A map the ring redirects is only published by its Unmap, so the ring needs both hooks live.
+		if (mapHooked && unmapHooked)
+			ConstantBufferRing::Install(d3d::device, a_context, ID3D11DeviceContext_Map::func.get(), ID3D11DeviceContext_Unmap::func.get());
+		else
+			logger::error("[CB Ring] Unavailable: the Map/Unmap hooks are not live; engine constant buffers stay on WRITE_DISCARD");
 	}
 }
