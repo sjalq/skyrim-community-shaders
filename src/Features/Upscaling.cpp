@@ -473,13 +473,13 @@ void Upscaling::DrawSettings()
 			ImGui::Checkbox(T(TKEY("dlssg_lock"), "Lock Presented FPS"), &settings.dlssgLock);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(T(TKEY("dlssg_lock_tooltip_1"), "Picks the multiplier itself and caps rendered frames at target / multiplier, so the presented frame rate stays between the minimum and the target, with VSync on or off. Overrides Dynamic Multi Frame Generation."));
-				ImGui::TextUnformatted(T(TKEY("dlssg_lock_tooltip_2"), "0 = auto: target = refresh - refresh^2 / 3600 (157 at 165 Hz), minimum = 93% of the target. Applies immediately."));
+				ImGui::TextUnformatted(T(TKEY("dlssg_lock_tooltip_2"), "Target under 60 = auto: refresh - refresh^2 / 3600 (157 at 165 Hz). Minimum under 30 = auto: 98.5% of the target. Applies immediately."));
 			}
 			if (settings.dlssgLock) {
 				ImGui::SliderFloat(T(TKEY("dlssg_lock_fps"), "Lock Target FPS (0 = auto)"), &settings.dlssgLockFps, 0.0f, 360.0f, "%.0f");
 				ImGui::SliderFloat(T(TKEY("dlssg_lock_min_fps"), "Lock Minimum FPS (0 = auto)"), &settings.dlssgLockMinFps, 0.0f, 360.0f, "%.0f");
 				if (fgLock.multiplier)
-					ImGui::Text("%s %ux, %.1f / %.1f FPS", T(TKEY("dlssg_lock_status"), "Lock: multiplier, rendered cap / engine capable"), fgLock.multiplier, fgLock.capFps, fgLock.capableFps);
+					ImGui::Text("%s %ux, %.1f / %.1f FPS", T(TKEY("dlssg_lock_status"), "Lock: multiplier, rendered cap / predicted presented"), fgLock.multiplier, fgLock.capFps, fgLock.predictedFps);
 			}
 
 			ImGui::Checkbox(T(TKEY("dlssg_ui_recomposition"), "UI Recomposition"), &settings.dlssgUIRecomposition);
@@ -1317,18 +1317,24 @@ void Upscaling::TimerSleepQPC(int64_t targetQPC)
 
 // Presented-FPS lock (settings.dlssgLock). Dynamic MFG keeps the presented rate below the refresh rate
 // with a margin and leaves gaps where no integer multiplier fits (an engine at 45 FPS presents 3x = 135),
-// and the limiter below only runs with VSync off. The lock picks the smallest multiplier N whose output
-// reaches the minimum at the engine's measured capability (90th percentile work time per rendered frame,
-// excluding the lock's own wait) and caps rendered frames at lock / N, so presented frames sit in
-// [minimum, lock]. Switching up is quick (3 frames), switching down needs a sustained 8% margin and backs
-// off when it flaps.
+// and the limiter below only runs with VSync off. The lock picks the smallest fixed multiplier N whose
+// predicted output reaches the minimum and waits before each present (after the frame's GPU work is
+// queued) so rendered frames are spaced at lock / N, deadline based with bounded catch-up.
+// The prediction replays the last 32 rendered frames' work times against each multiplier's cap (frames
+// faster than the cap wait for it, slower ones stretch it; the worst frame is ignored). Work time is CPU
+// side and cannot see GPU load while the cap binds (the GPU catches up during the wait), so a step down
+// also needs the frame's GPU work to have finished inside the lower multiplier's interval (the D3D11
+// input fence is polled during the wait). Steps up are immediate when the last two frames miss; steps
+// down need a sustained 3% margin and back off when they flap. Frames DLSS-G does not actually generate
+// (fallback to fewer frames, failure status, menus) are never capped for frames that do not exist.
 namespace
 {
 	void ResolveFrameGenLockTargets(const Upscaling::Settings& a_settings, double a_refreshRate, double& a_lockFps, double& a_minFps)
 	{
-		const double refresh = a_refreshRate >= 30.0 ? a_refreshRate : 60.0;
-		a_lockFps = a_settings.dlssgLockFps > 0.0f ? static_cast<double>(a_settings.dlssgLockFps) : refresh - refresh * refresh / 3600.0;
-		a_minFps = a_settings.dlssgLockMinFps > 0.0f ? std::min(static_cast<double>(a_settings.dlssgLockMinFps), a_lockFps) : a_lockFps * 0.93;
+		const double refresh = a_refreshRate >= 60.0 ? a_refreshRate : 144.0;
+		// A lock under 60 (e.g. while dragging the slider up from 0) means auto, never a crawl.
+		a_lockFps = a_settings.dlssgLockFps >= 60.0f ? static_cast<double>(a_settings.dlssgLockFps) : refresh - refresh * refresh / 3600.0;
+		a_minFps = a_settings.dlssgLockMinFps >= 30.0f ? std::min(static_cast<double>(a_settings.dlssgLockMinFps), a_lockFps) : a_lockFps * 0.985;
 	}
 }
 
@@ -1355,76 +1361,100 @@ uint32_t Upscaling::FrameGenLockMultiplier()
 		s.multiplier = maxMultiplier;
 		s.maxMultiplier = maxMultiplier;
 		s.upFrames = s.downFrames = 0;
+		s.presentedEma = static_cast<float>(maxMultiplier);
 		logger::info("[Frame Generation] FPS lock on: presented {:.1f}-{:.1f} FPS (refresh {:.2f} Hz), starting at {}x (GPU max {}x)",
 			minFps, lockFps, refreshRate, s.multiplier, maxMultiplier);
 	}
+	s.requested = s.multiplier;
 	return s.multiplier;
 }
 
-void Upscaling::SleepUntilQPC(int64_t targetQPC) const
-{
-	// Sleep in 1 ms steps while more than 2 ms remain, then spin: precise without burning a core for
-	// the whole wait (TimerSleepQPC spins for all of it).
-	const int64_t ticks2ms = qpf.QuadPart / 500;
-	LARGE_INTEGER now;
-	QueryPerformanceCounter(&now);
-	while (targetQPC - now.QuadPart > ticks2ms) {
-		Sleep(1);
-		QueryPerformanceCounter(&now);
-	}
-	while (now.QuadPart < targetQPC) {
-		YieldProcessor();
-		QueryPerformanceCounter(&now);
-	}
-}
-
-void Upscaling::FrameGenLockLimiter(bool generatingThisFrame)
+void Upscaling::FrameGenLockWait(bool a_generating, uint32_t a_appliedMultiplier, uint32_t a_framesPresented,
+	ID3D12Fence* a_gpuFence, uint64_t a_gpuFenceValue)
 {
 	auto& s = fgLock;
 	LARGE_INTEGER now;
 	QueryPerformanceCounter(&now);
 
-	if (!generatingThisFrame || s.multiplier == 0 || s.lastExitQPC == 0 || qpf.QuadPart <= 0) {
-		// Menus, loading screens, the first frame: no cap, restart the measurement window.
-		s.lastExitQPC = now.QuadPart;
+	// What DLSS-G really produces: the multiplier it applied (fallbacks, failure status) and the frames it
+	// reports presenting per rendered frame.
+	if (a_generating)
+		s.presentedEma += (static_cast<float>(a_framesPresented) - s.presentedEma) / 16.0f;
+	const bool generating = a_generating && a_appliedMultiplier >= 2 && s.presentedEma >= 1.5f;
+	if (a_generating && !generating && !s.notGeneratingLogged) {
+		s.notGeneratingLogged = true;
+		logger::warn("[Frame Generation] FPS lock: DLSS-G is not generating (applied {}x, {:.2f} frames presented per rendered frame); not capping",
+			a_appliedMultiplier, s.presentedEma);
+	}
+
+	if (!generating || s.multiplier == 0 || s.lastExitQPC == 0 || qpf.QuadPart <= 0) {
+		// Menus, loading screens, the first frame, DLSS-G not generating: no cap, restart the measurement.
+		s.lastExitQPC = s.deadlineQPC = now.QuadPart;
 		s.head = s.samples = 0;
 		s.upFrames = s.downFrames = 0;
+		s.capNext = 0;
+		s.gpuFitsLower = false;
 		return;
 	}
 
 	const double ticksPerMs = static_cast<double>(qpf.QuadPart) / 1000.0;
-	s.workMs[s.head] = static_cast<float>(static_cast<double>(now.QuadPart - s.lastExitQPC) / ticksPerMs);
+	const int64_t frameStartQPC = s.lastExitQPC;
+	s.workMs[s.head] = static_cast<float>(static_cast<double>(now.QuadPart - frameStartQPC) / ticksPerMs);
 	s.head = (s.head + 1) % FrameGenLock::kWindow;
 	s.samples = std::min(s.samples + 1, FrameGenLock::kWindow);
 	s.framesSinceDown = std::min(s.framesSinceDown + 1, 1u << 30);
 	s.framesSinceUp = std::min(s.framesSinceUp + 1, 1u << 30);
-	if (s.framesSinceUp > 1800)
-		s.downHold = FrameGenLock::kMinDownHold;
+	if (s.framesSinceDown > 1800 && s.framesSinceDown < s.framesSinceUp)
+		s.downHold = FrameGenLock::kMinDownHold;  // the last step down held for a minute: forget the flapping
 
 	double lockFps = 0.0, minFps = 0.0;
 	ResolveFrameGenLockTargets(settings, refreshRate, lockFps, minFps);
 	const uint32_t maxMultiplier = std::max(s.maxMultiplier, 2u);
+	const uint32_t previous = s.multiplier;
 
-	if (s.samples >= 8) {
-		std::array<float, FrameGenLock::kWindow> sorted{};
-		std::copy_n(s.workMs.begin(), s.samples, sorted.begin());
-		const uint32_t idx = std::min(s.samples - 1, (s.samples * 9) / 10);
-		std::nth_element(sorted.begin(), sorted.begin() + idx, sorted.begin() + s.samples);
-		const double capableFps = 1000.0 / std::max(0.5, static_cast<double>(sorted[idx]));
-		s.capableFps = static_cast<float>(capableFps);
+	// Predicted presented FPS at multiplier n over the window: frames faster than the cap wait for it,
+	// slower ones stretch it; the single worst frame is ignored so one hitch does not move n.
+	const auto predictedFps = [&](uint32_t n) {
+		const double capMs = 1000.0 * static_cast<double>(n) / lockFps;
+		double sumMs = 0.0, worstMs = 0.0;
+		for (uint32_t i = 0; i < s.samples; ++i) {
+			const double ms = std::max(static_cast<double>(s.workMs[i]), capMs);
+			sumMs += ms;
+			worstMs = std::max(worstMs, ms);
+		}
+		const double frames = static_cast<double>(s.samples > 1 ? s.samples - 1 : s.samples);
+		const double spanMs = s.samples > 1 ? sumMs - worstMs : sumMs;
+		return 1000.0 * static_cast<double>(n) * frames / std::max(spanMs, 1e-3);
+	};
+	const auto back = [&](uint32_t k) {
+		return static_cast<double>(s.workMs[(s.head + FrameGenLock::kWindow - k) % FrameGenLock::kWindow]);
+	};
+	const auto stepUp = [&](uint32_t n) {
+		if (s.framesSinceDown < 150)
+			s.downHold = std::min(s.downHold * 2, FrameGenLock::kMaxDownHold);  // flapping: hold lower multipliers back longer
+		s.multiplier = n;
+		s.upFrames = s.downFrames = 0;
+		s.framesSinceUp = 0;
+	};
 
-		const uint32_t needed = std::clamp(static_cast<uint32_t>(std::ceil(minFps / capableFps - 1e-6)), 2u, maxMultiplier);
-		const uint32_t previous = s.multiplier;
-		if (needed > s.multiplier) {
+	if (s.samples >= 2 && s.multiplier < maxMultiplier) {
+		// Fast path: both of the last two frames were too slow for this multiplier to reach the minimum.
+		const double slowMs = std::min(back(1), back(2));
+		if (1000.0 * static_cast<double>(s.multiplier) / std::max(slowMs, 1e-3) < minFps)
+			stepUp(std::clamp(static_cast<uint32_t>(std::ceil(minFps * slowMs / 1000.0 - 1e-6)), s.multiplier + 1, maxMultiplier));
+	}
+	if (s.multiplier == previous && s.samples >= 8) {
+		const double atCurrent = predictedFps(s.multiplier);
+		s.predictedFps = static_cast<float>(atCurrent);
+		if (atCurrent < minFps && s.multiplier < maxMultiplier) {
 			s.downFrames = 0;
 			if (++s.upFrames >= FrameGenLock::kUpFrames) {
-				if (s.framesSinceDown < 150)
-					s.downHold = std::min(s.downHold * 2, FrameGenLock::kMaxDownHold);  // flapping: hold lower multipliers back longer
-				s.multiplier = needed;
-				s.upFrames = 0;
-				s.framesSinceUp = 0;
+				uint32_t n = s.multiplier + 1;
+				while (n < maxMultiplier && predictedFps(n) < minFps)
+					++n;
+				stepUp(n);
 			}
-		} else if (needed < s.multiplier && capableFps >= minFps / static_cast<double>(s.multiplier - 1) * 1.08) {
+		} else if (s.multiplier > 2 && s.gpuFitsLower && predictedFps(s.multiplier - 1) >= minFps * 1.03) {
 			s.upFrames = 0;
 			if (++s.downFrames >= s.downHold) {
 				s.multiplier--;
@@ -1435,18 +1465,53 @@ void Upscaling::FrameGenLockLimiter(bool generatingThisFrame)
 			s.upFrames = 0;
 			s.downFrames = 0;
 		}
-		if (s.multiplier != previous)
-			logger::info("[Frame Generation] FPS lock: {}x -> {}x (engine p90 {:.1f} FPS, rendered cap {:.1f} FPS, presented {:.1f}-{:.1f}, down hold {} frames)",
-				previous, s.multiplier, capableFps, lockFps / s.multiplier, minFps, lockFps, s.downHold);
+	}
+	if (s.multiplier != previous)
+		logger::info("[Frame Generation] FPS lock: {}x -> {}x (last work {:.1f} ms, predicted {:.1f} FPS at {}x, rendered cap {:.1f} FPS, presented {:.1f}-{:.1f}, down hold {} frames)",
+			previous, s.multiplier, back(1), predictedFps(previous), previous, lockFps / s.multiplier, minFps, lockFps, s.downHold);
+	if (++s.statusFrames >= 1800) {
+		s.statusFrames = 0;
+		logger::info("[Frame Generation] FPS lock status: {}x, rendered cap {:.1f} FPS, predicted {:.1f} FPS, DLSS-G presenting {:.2f} per rendered frame, down hold {} frames",
+			s.multiplier, s.capFps, s.predictedFps, s.presentedEma, s.downHold);
 	}
 
-	s.capFps = static_cast<float>(lockFps / s.multiplier);
-	const int64_t capTicks = static_cast<int64_t>(static_cast<double>(qpf.QuadPart) * static_cast<double>(s.multiplier) / lockFps);
-	if (now.QuadPart < s.lastExitQPC + capTicks)
-		SleepUntilQPC(s.lastExitQPC + capTicks);
-	LARGE_INTEGER exitQPC;
-	QueryPerformanceCounter(&exitQPC);
-	s.lastExitQPC = exitQPC.QuadPart;
+	// Wait for this frame's slot. The frames DLSS-G generated at the last present fill the interval up to
+	// this present, so that multiplier sets the interval. Deadline based: a frame that ran long is caught up
+	// over the next frames, never presenting rendered frames faster than refresh / multiplier.
+	const uint32_t applied = std::min(s.requested ? s.requested : s.multiplier, a_appliedMultiplier);
+	const uint32_t capMultiplier = s.capNext ? s.capNext : applied;
+	s.capNext = applied;
+	const double refresh = refreshRate >= 60.0 ? std::max(refreshRate, lockFps) : lockFps;
+	const int64_t capTicks = static_cast<int64_t>(static_cast<double>(qpf.QuadPart) * capMultiplier / lockFps);
+	const int64_t minTicks = static_cast<int64_t>(static_cast<double>(qpf.QuadPart) * capMultiplier / refresh);
+	int64_t target = std::max(s.deadlineQPC + capTicks, frameStartQPC + minTicks);
+	if (now.QuadPart - target > capTicks)
+		target = now.QuadPart;  // more than one interval behind (a hitch): drop the debt
+	s.capFps = static_cast<float>(lockFps / capMultiplier);
+
+	int64_t gpuDoneQPC = 0;
+	const auto probe = [&] {
+		if (!gpuDoneQPC && a_gpuFence && a_gpuFence->GetCompletedValue() >= a_gpuFenceValue)
+			gpuDoneQPC = now.QuadPart;
+	};
+	probe();
+	const int64_t ticks2ms = qpf.QuadPart / 500;
+	while (target - now.QuadPart > ticks2ms) {
+		Sleep(1);
+		QueryPerformanceCounter(&now);
+		probe();
+	}
+	while (now.QuadPart < target) {
+		YieldProcessor();
+		QueryPerformanceCounter(&now);
+		probe();
+	}
+	s.deadlineQPC = target;
+	s.lastExitQPC = now.QuadPart;
+
+	// Step-down gate: did the GPU finish this frame's rendering inside the lower multiplier's interval?
+	const double lowerTicks = static_cast<double>(qpf.QuadPart) * static_cast<double>(s.multiplier > 2 ? s.multiplier - 1 : 1) / lockFps;
+	s.gpuFitsLower = gpuDoneQPC != 0 && static_cast<double>(gpuDoneQPC - frameStartQPC) <= 0.95 * lowerTicks;
 }
 
 void Upscaling::FrameLimiter()

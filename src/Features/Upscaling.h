@@ -89,8 +89,8 @@ public:
 		// Presented-FPS lock (overrides Dynamic MFG while on, applied live, works with VSync on): CS picks
 		// the fixed multiplier N itself, the smallest whose output reaches dlssgLockMinFps at the engine's
 		// measured capability, and caps rendered frames at dlssgLockFps / N, so presented frames stay in
-		// [dlssgLockMinFps, dlssgLockFps]. 0 = auto: lock = refresh - refresh^2 / 3600 (NVIDIA's G-SYNC +
-		// Reflex cap, 157.4 at 165 Hz), minimum = 93% of the lock.
+		// [dlssgLockMinFps, dlssgLockFps]. Lock under 60 = auto: refresh - refresh^2 / 3600 (NVIDIA's G-SYNC +
+		// Reflex cap, 157.4 at 165 Hz); minimum under 30 = auto: 98.5% of the lock.
 		bool dlssgLock = false;
 		float dlssgLockFps = 0.0f;
 		float dlssgLockMinFps = 0.0f;
@@ -145,7 +145,7 @@ public:
 	struct FrameGenLock
 	{
 		static constexpr uint32_t kWindow = 32;         ///< rendered frames in the work-time window
-		static constexpr uint32_t kUpFrames = 3;        ///< frames a higher multiplier must be needed before switching up
+		static constexpr uint32_t kUpFrames = 2;        ///< frames the prediction must miss before switching up
 		static constexpr uint32_t kMinDownHold = 60;    ///< frames a lower multiplier must be sustainable before switching down
 		static constexpr uint32_t kMaxDownHold = 1920;  ///< hold after repeated down/up flapping
 		std::array<float, kWindow> workMs{};
@@ -158,9 +158,16 @@ public:
 		uint32_t downHold = kMinDownHold;
 		uint32_t framesSinceDown = 1u << 30;
 		uint32_t framesSinceUp = 1u << 30;
-		int64_t lastExitQPC = 0;
-		float capableFps = 0.0f;  ///< engine rate at the 90th percentile frame work time
-		float capFps = 0.0f;      ///< rendered-frame cap = lock / multiplier
+		uint32_t requested = 0;   ///< multiplier handed to DLSS-G this frame
+		uint32_t capNext = 0;     ///< multiplier DLSS-G applied at the last present: it fills the next interval
+		int64_t lastExitQPC = 0;  ///< end of the last wait = start of the next rendered frame's work
+		int64_t deadlineQPC = 0;  ///< scheduled present time of the last frame (deadline pacing)
+		bool gpuFitsLower = false;
+		bool notGeneratingLogged = false;
+		float presentedEma = 0.0f;  ///< frames DLSS-G reports presenting per rendered frame (EMA over 16)
+		float predictedFps = 0.0f;  ///< predicted presented FPS at the current multiplier
+		float capFps = 0.0f;        ///< rendered-frame cap = lock / multiplier
+		uint32_t statusFrames = 0;
 	} fgLock;
 
 	// FG FPS Measurement for Overlay
@@ -276,9 +283,9 @@ public:
 	// Presented-FPS lock (settings.dlssgLock), see Upscaling.cpp
 	bool FrameGenLockActive() const;
 	uint32_t FrameGenLockMultiplier();
-	void FrameGenLockLimiter(bool generatingThisFrame);
+	void FrameGenLockWait(bool a_generating, uint32_t a_appliedMultiplier, uint32_t a_framesPresented,
+		ID3D12Fence* a_gpuFence, uint64_t a_gpuFenceValue);
 	void FrameGenLockReset();
-	void SleepUntilQPC(int64_t targetQPC) const;
 
 	static double GetRefreshRate(HWND a_window);
 

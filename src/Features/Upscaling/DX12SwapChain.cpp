@@ -763,6 +763,17 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
 	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
 
+	// Presented-FPS lock: wait for this rendered frame's slot after its GPU work is queued and before its
+	// present, so presents are evenly spaced (the placement of Display Tweaks FramerateLimitMode=0). The
+	// D3D11 input fence tells the lock when the GPU finished rendering this frame.
+	if (fpsLock) {
+		auto& slDX12 = upscaling.streamlineDX12;
+		const uint32_t applied = (slDX12.dlssgEnabledLastFrame && slDX12.dlssgStatus == sl::DLSSGStatus::eOk) ?
+		                             slDX12.dlssgFramesToGenerateActive + 1 :
+		                             1;
+		upscaling.FrameGenLockWait(dlssgGenerating, applied, slDX12.dlssgFramesPresented, inputReadyFence12.get(), inputReadyValue);
+	}
+
 	// Present the frame. DLSS-G matches the presented frame to its constants/tags through the
 	// ePresentStart marker, so the markers carry the same frame index.
 	if (useDLSSG) {
@@ -793,11 +804,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	float clearColor[4]{ 0, 0, 0, 0 };
 	d3d11Context->ClearRenderTargetView(uiBufferWrapped->rtv, clearColor);
 
-	// Presented-FPS lock: cap rendered frames at lock / multiplier, with VSync on or off.
-	// Otherwise, if VSync is disabled, use frame limiter to prevent tearing and optimise pacing
-	if (fpsLock)
-		upscaling.FrameGenLockLimiter(dlssgGenerating);
-	else if (SyncInterval == 0)
+	// If VSync is disabled, use frame limiter to prevent tearing and optimise pacing (the presented-FPS
+	// lock paces its own presents above)
+	if (!fpsLock && SyncInterval == 0)
 		upscaling.FrameLimiter();
 
 	return S_OK;
