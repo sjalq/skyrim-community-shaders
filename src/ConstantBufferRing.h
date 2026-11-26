@@ -15,12 +15,10 @@
  * *SetConstantBuffers1 to every stage/slot where the engine buffer is bound. The ring itself is only
  * discarded when it wraps; every buffer still bound at that point is uploaded again and rebound.
  * An Unmap whose shadow equals the buffer's latest upload, while no wrap has discarded that range, binds
- * the existing range instead of copying again, and binds nothing when every slot already shows it. A
- * changed Unmap keeps the shadow as the latest contents and hands the next map the previous upload's
- * storage instead of copying (WRITE_DISCARD leaves contents undefined; WRITE_NO_OVERWRITE first gets the
- * latest contents back). Under DXVK, whose buffer Unmap does nothing and whose
- * WRITE_NO_OVERWRITE maps return the pointer of the latest discard, uploads write through the pointer the
- * wrap's discard returned instead of mapping the ring for every upload.
+ * the existing range instead of copying again, and binds nothing when every slot already shows it.
+ * Under DXVK, whose buffer Unmap does nothing and whose WRITE_NO_OVERWRITE maps return the pointer of
+ * the latest discard, uploads write through the pointer the wrap's discard returned instead of mapping
+ * the ring for every upload.
  *
  * Every constant buffer binding entry point of the immediate context is hooked so D3D11 semantics hold:
  * binds of ring-managed buffers become ring ranges, *GetConstantBuffers report the buffers the
