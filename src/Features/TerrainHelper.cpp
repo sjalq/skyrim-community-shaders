@@ -164,16 +164,16 @@ void TerrainHelper::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialB
 		return;
 	}
 
-	ExtendedSlots materialBase;
-	{
-		const std::shared_lock lock(extendedSlotsMutex);
-
-		if (!extendedSlots.contains(material->hashKey)) {
-			// hash does not exists
-			return;
-		}
-		materialBase = extendedSlots[material->hashKey];
+	// Read the slots in place while holding the shared lock instead of copying ExtendedSlots: the copy
+	// cost six NiPointer reference increments and decrements per material setup, and the map's own
+	// references keep the textures alive while the lock blocks TESObjectLAND_SetupMaterial writes.
+	const std::shared_lock lock(extendedSlotsMutex);
+	const auto slots = extendedSlots.find(material->hashKey);
+	if (slots == extendedSlots.end()) {
+		// hash does not exists
+		return;
 	}
+	const auto& parallax = slots->second.parallax;
 
 	const auto state = globals::state;
 	const auto& stateData = globals::game::graphicsState->GetRuntimeData();
@@ -183,8 +183,8 @@ void TerrainHelper::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialB
 	// Populate extended slots
 	// Bits 0-5 track individual texture displacement; THLandHasDisplacement (bit 9) tracks if any texture has displacement
 	for (uint32_t textureI = 0; textureI < 6; ++textureI) {
-		if (materialBase.parallax[textureI] != nullptr && materialBase.parallax[textureI] != stateData.defaultTextureNormalMap) {
-			thExtendedRendererState.SetPSTexture(textureI, materialBase.parallax[textureI]->rendererTexture);
+		if (parallax[textureI] != nullptr && parallax[textureI] != stateData.defaultTextureNormalMap) {
+			thExtendedRendererState.SetPSTexture(textureI, parallax[textureI]->rendererTexture);
 			state->permutationData.ExtraFeatureDescriptor |= 1 << textureI;
 			state->permutationData.ExtraFeatureDescriptor |= uint(State::ExtraFeatureDescriptors::THLandHasDisplacement);
 		} else {

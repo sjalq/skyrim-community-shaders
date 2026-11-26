@@ -29,8 +29,10 @@ void ExtendedTranslucency::BSLightingShader_SetupGeometry(RE::BSRenderPass* pass
 	// Clear the ExtraFeatureDescriptor to disable this effect on default
 	SetFeatureDescriptor(MaterialModel::DescriptorDisabled);
 
-	auto& property0 = pass->geometry->GetGeometryRuntimeData().alphaProperty;
-	auto& property1 = pass->geometry->GetGeometryRuntimeData().shaderProperty;
+	// Runs for every lighting draw: resolve the SE/AE runtime-data offset once instead of per field.
+	const auto& geometryData = pass->geometry->GetGeometryRuntimeData();
+	auto& property0 = geometryData.alphaProperty;
+	auto& property1 = geometryData.shaderProperty;
 	auto alphaProperty = property0 && property0->GetRTTI() == globals::rtti::NiAlphaPropertyRTTI.get() ? static_cast<RE::NiAlphaProperty*>(property0.get()) : nullptr;
 	auto lightProperty = property1 && property1->GetRTTI() == globals::rtti::BSLightingShaderPropertyRTTI.get() ? static_cast<RE::BSLightingShaderProperty*>(property1.get()) : nullptr;
 
@@ -45,7 +47,7 @@ void ExtendedTranslucency::BSLightingShader_SetupGeometry(RE::BSRenderPass* pass
 		// If there is no extra data for explicit settings, use the default material model from global user settings
 		// And respect the SkinnedOnly setting
 		const auto& feature = globals::features::extendedTranslucency;
-		if (!feature.settings.SkinnedOnly || pass->geometry->GetGeometryRuntimeData().skinInstance != nullptr) {
+		if (!feature.settings.SkinnedOnly || geometryData.skinInstance != nullptr) {
 			SetFeatureDescriptor(MaterialModel::DescriptorUseDefault);
 		}
 	} else {
