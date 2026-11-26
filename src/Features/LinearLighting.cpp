@@ -1,6 +1,7 @@
 #include "LinearLighting.h"
 
 #include "../I18n/I18n.h"
+#include "ConstantBufferRing.h"
 #include "State.h"
 
 #include "Effects11.h"
@@ -255,7 +256,10 @@ void LinearLighting::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			emissiveMult = lightProperty->emissiveMult;
 			PerGeometryData perGeometryData{};
 			perGeometryData.emissiveMult = emissiveMult;
-			PerGeometryCB->Update(perGeometryData);
+			// Every lighting draw, so through the constant buffer ring while it is active: unchanged contents
+			// reuse their ring range instead of costing a DXVK buffer rename each.
+			if (!ConstantBufferRing::PublishOwned(PerGeometryCB->CB(), &perGeometryData, sizeof(perGeometryData)))
+				PerGeometryCB->Update(perGeometryData);
 
 			ID3D11Buffer* buffer = { PerGeometryCB->CB() };
 			auto context = globals::d3d::context;

@@ -52,7 +52,7 @@ namespace ConstantBufferRing
 		using Set1Func = void (*)(ID3D11DeviceContext1*, UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*);
 		using GetFunc = void (*)(ID3D11DeviceContext*, UINT, UINT, ID3D11Buffer**);
 
-		/** @brief An engine constant buffer whose contents live in the ring. */
+		/** @brief A constant buffer whose contents live in the ring (an engine buffer, or one CS publishes via PublishOwned). */
 		struct Record
 		{
 			ID3D11Buffer* buffer = nullptr;         // one reference is held so the address cannot be reused
@@ -68,6 +68,7 @@ namespace ConstantBufferRing
 			uint32_t generation = 0;                         // ring generation of that upload; 0 = never uploaded
 			std::array<uint16_t, kStageCount> boundSlots{};  // slots that logically hold this buffer
 			bool mapped = false;
+			bool owned = false;  // taken over by PublishOwned rather than by an engine map
 			// Every slot in boundSlots has the record's latest upload bound (boundFirst/boundCount equal
 			// RingWindow), so RebindRecord would bind nothing. Set by RebindRecord; cleared by CopyToRing
 			// (new range) and ForgetBindings, false for a new record. ApplyBinds binds every slot it tracks
@@ -125,9 +126,11 @@ namespace ConstantBufferRing
 			uint32_t uploadsLastFrame = 0;
 			uint32_t dedupedThisFrame = 0;
 			uint32_t rebindsSkippedThisFrame = 0;
+			uint32_t ownedPublishesThisFrame = 0;
 			uint64_t uploadsSinceActivation = 0;
 			uint64_t dedupedSinceActivation = 0;
 			uint64_t rebindsSkippedSinceActivation = 0;
+			uint64_t ownedPublishesSinceActivation = 0;
 			uint64_t wrapsSinceActivation = 0;
 			uint32_t framesSinceActivation = 0;
 			bool loggedStats = false;
@@ -419,6 +422,7 @@ namespace ConstantBufferRing
 			g.uploadsSinceActivation = 0;
 			g.dedupedSinceActivation = 0;
 			g.rebindsSkippedSinceActivation = 0;
+			g.ownedPublishesSinceActivation = 0;
 			g.wrapsSinceActivation = 0;
 			g.framesSinceActivation = 0;
 			g.active.store(true, std::memory_order_relaxed);
@@ -470,6 +474,33 @@ namespace ConstantBufferRing
 				Deactivate(a_reason);
 			else
 				logger::info("[CB Ring] Engine constant buffer ring disabled for this session ({})", a_reason);
+		}
+
+		/**
+		 * @brief Makes the record's shadow current on every slot that holds it, as the Unmap of a redirected map does.
+		 * @return False when a ring map failed. The ring is then off for the session (the record is destroyed)
+		 *         and deactivation has written the shadow into the buffer itself.
+		 */
+		[[nodiscard]] bool Publish(Record& a_record)
+		{
+			// Contents equal to the latest upload, whose range no wrap has discarded since, reuse that range.
+			if (a_record.generation != 0 && a_record.generation == g.generation &&
+				std::memcmp(a_record.shadow.get(), a_record.lastUpload.get(), a_record.byteWidth) == 0) {
+				++g.dedupedThisFrame;
+				// Nothing changed since every slot of the record was last bound to that range.
+				if (a_record.bindingsCurrent) {
+					++g.rebindsSkippedThisFrame;
+					return true;
+				}
+			} else {
+				Upload(a_record);
+				if (g.uploadFailed) {
+					DisableForSession("a ring map failed");
+					return false;
+				}
+			}
+			RebindRecord(a_record);
+			return true;
 		}
 
 		void CallOriginal(Stage a_stage, UINT a_start, UINT a_count, ID3D11Buffer* const* a_buffers, const UINT* a_first,
@@ -790,6 +821,7 @@ namespace ConstantBufferRing
 		g.uploadsSinceActivation += g.uploadsLastFrame;
 		g.dedupedSinceActivation += std::exchange(g.dedupedThisFrame, 0);
 		g.rebindsSkippedSinceActivation += std::exchange(g.rebindsSkippedThisFrame, 0);
+		g.ownedPublishesSinceActivation += std::exchange(g.ownedPublishesThisFrame, 0);
 
 		if (g.uploadFailed && g.active.load(std::memory_order_relaxed))
 			DisableForSession("a ring map failed");
@@ -803,10 +835,12 @@ namespace ConstantBufferRing
 
 		if (g.active.load(std::memory_order_relaxed) && !g.loggedStats && ++g.framesSinceActivation == kStatsLogFrame) {
 			g.loggedStats = true;
-			logger::info("[CB Ring] After {} frames: {} engine constant buffers on the ring, {:.0f} uploads per frame, {:.0f} unchanged uploads skipped per frame, {:.0f} rebinds skipped per frame, {} ring wraps",
-				kStatsLogFrame, g.records.size(), static_cast<double>(g.uploadsSinceActivation) / kStatsLogFrame,
+			const auto ownedBuffers = std::ranges::count_if(g.records, [](const auto& a_record) { return a_record->owned; });
+			logger::info("[CB Ring] After {} frames: {} engine constant buffers on the ring, {:.0f} uploads per frame, {:.0f} unchanged uploads skipped per frame, {:.0f} rebinds skipped per frame, {} ring wraps, {:.0f} owned publishes per frame ({} Community Shaders constant buffers on the ring)",
+				kStatsLogFrame, g.records.size() - static_cast<std::size_t>(ownedBuffers), static_cast<double>(g.uploadsSinceActivation) / kStatsLogFrame,
 				static_cast<double>(g.dedupedSinceActivation) / kStatsLogFrame,
-				static_cast<double>(g.rebindsSkippedSinceActivation) / kStatsLogFrame, g.wrapsSinceActivation);
+				static_cast<double>(g.rebindsSkippedSinceActivation) / kStatsLogFrame, g.wrapsSinceActivation,
+				static_cast<double>(g.ownedPublishesSinceActivation) / kStatsLogFrame, ownedBuffers);
 		}
 	}
 
@@ -850,24 +884,9 @@ namespace ConstantBufferRing
 		if (Record* record = Find(a_resource); record && record->mapped) {
 			record->mapped = false;
 			--g.mappedCount;
-			// Contents equal to the latest upload, whose range no wrap has discarded since, reuse that range.
-			if (record->generation != 0 && record->generation == g.generation &&
-				std::memcmp(record->shadow.get(), record->lastUpload.get(), record->byteWidth) == 0) {
-				++g.dedupedThisFrame;
-				// Nothing changed since every slot of the record was last bound to that range.
-				if (record->bindingsCurrent) {
-					++g.rebindsSkippedThisFrame;
-					return true;
-				}
-			} else {
-				Upload(*record);
-				if (g.uploadFailed) {
-					// Deactivation writes the shadow into the engine buffer itself, so this update still lands.
-					DisableForSession("a ring map failed");
-					return true;
-				}
-			}
-			RebindRecord(*record);
+			// When a ring map fails, deactivation writes the shadow into the engine buffer itself, so this
+			// update still lands either way.
+			(void)Publish(*record);
 			return true;
 		}
 
@@ -879,5 +898,29 @@ namespace ConstantBufferRing
 		(*draining)->buffer->Release();
 		g.draining.erase(draining);
 		return true;
+	}
+
+	bool PublishOwned(ID3D11Buffer* a_buffer, const void* a_data, UINT a_size)
+	{
+		// The thread check comes first: the ring state is only touched on the render thread.
+		if (!OnRenderThread() || !g.active.load(std::memory_order_relaxed) || !a_buffer || !a_data || a_size == 0)
+			return false;
+
+		Record* record = Find(a_buffer);
+		if (!record) {
+			// Manage() also picks up the slots this buffer is already bound to, so the publish below rebinds them.
+			record = Manage(a_buffer);
+			if (!record)
+				return false;
+			record->owned = true;
+		}
+		// A map of the buffer through the Map hook is in flight (its Unmap publishes), or the data does not fit.
+		if (record->mapped || a_size > record->byteWidth)
+			return false;
+
+		std::memcpy(record->shadow.get(), a_data, a_size);
+		++g.ownedPublishesThisFrame;
+		// On failure the ring is off and the record gone; the caller's own update then reaches the buffer directly.
+		return Publish(*record);
 	}
 }

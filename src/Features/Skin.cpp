@@ -1,6 +1,7 @@
 #include "Skin.h"
 #include <DirectXTex.h>
 
+#include "ConstantBufferRing.h"
 #include "Deferred.h"
 #include "Globals.h"
 #include "Hooks.h"
@@ -579,7 +580,9 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			currentWetness = wetness;
 			PerGeometryData perGeometryData{};
 			perGeometryData.skinPerGeometry = wetness;
-			PerGeometryCB->Update(perGeometryData);
+			// Per draw, so through the constant buffer ring while it is active (no DXVK buffer rename per change).
+			if (!ConstantBufferRing::PublishOwned(PerGeometryCB->CB(), &perGeometryData, sizeof(perGeometryData)))
+				PerGeometryCB->Update(perGeometryData);
 		}
 
 		ID3D11Buffer* buffer = { PerGeometryCB->CB() };

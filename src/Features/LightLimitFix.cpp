@@ -1,4 +1,5 @@
 #include "LightLimitFix.h"
+#include "ConstantBufferRing.h"
 #include "Effects11.h"
 #include "InverseSquareLighting.h"
 #include "LinearLighting.h"
@@ -314,7 +315,9 @@ void LightLimitFix::BSLightingShader_SetupGeometry_After(RE::BSRenderPass*)
 	const auto shadowBitMask = strictLightDataTemp.ShadowBitMask;
 
 	if (!isEmpty || (isEmpty && !wasEmpty) || isWorld != wasWorld || previousRoomIndex != roomIndex || shadowBitMask != previousShadowBitMask) {
-		strictLightDataCB->Update(strictLightDataTemp);
+		// Per draw, so through the constant buffer ring while it is active (no DXVK buffer rename per update).
+		if (!ConstantBufferRing::PublishOwned(strictLightDataCB->CB(), &strictLightDataTemp, sizeof(strictLightDataTemp)))
+			strictLightDataCB->Update(strictLightDataTemp);
 		wasEmpty = isEmpty;
 		wasWorld = isWorld;
 		previousRoomIndex = roomIndex;

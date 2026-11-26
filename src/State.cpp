@@ -125,7 +125,9 @@ void State::Draw()
 		}
 
 		if (permutationData != permutationDataPrevious) {
-			permutationCB->Update(permutationData);
+			// Per draw, so through the constant buffer ring while it is active (no DXVK buffer rename per change).
+			if (!ConstantBufferRing::PublishOwned(permutationCB->CB(), &permutationData, sizeof(permutationData)))
+				permutationCB->Update(permutationData);
 			permutationDataPrevious = permutationData;
 		}
 

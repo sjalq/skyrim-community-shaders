@@ -30,8 +30,9 @@
  * - Only the thread that created the device (the thread the game renders on) is redirected; other
  *   threads and deferred contexts pass straight through.
  * - The engine's per-frame buffer stays on the original path so CacheFramebuffer keeps working.
- * - Buffers are only taken over when the game executable maps them first, so Community Shaders'
- *   own buffers, ImGui's and other plugins' are never managed.
+ * - Buffers are only taken over when the game executable maps them first, or when Community Shaders
+ *   publishes one of its own per-draw buffers through PublishOwned. ImGui's and other plugins' buffers
+ *   are never managed.
  */
 namespace ConstantBufferRing
 {
@@ -99,4 +100,19 @@ namespace ConstantBufferRing
 	 * @return True when the unmap completed a redirected map; the original Unmap must then not run.
 	 */
 	bool TryUnmap(ID3D11DeviceContext* a_context, ID3D11Resource* a_resource, UINT a_subresource);
+
+	/**
+	 * @brief Publishes new contents of a dynamic constant buffer Community Shaders owns through the ring.
+	 *
+	 * Replaces a Map(WRITE_DISCARD)/memcpy/Unmap of a buffer updated per draw, which DXVK turns into a
+	 * buffer rename. The first call takes the buffer over like an engine buffer (shadow copy, unchanged
+	 * contents reuse their ring range, rebinds only where needed); every call copies `a_data` into the
+	 * shadow and publishes it exactly as an engine Unmap does. Binds of the buffer through the immediate
+	 * context's *SetConstantBuffers* hooks then bind its latest ring range, as for engine buffers.
+	 * Bytes past `a_size` keep their previous contents.
+	 * @return False when the ring did not take the update: the ring is off, the call is not on the render
+	 *         thread, the buffer is unsuitable, or a ring map failed (the ring is then off). The caller
+	 *         then updates the buffer itself, e.g. with ConstantBuffer::Update.
+	 */
+	[[nodiscard]] bool PublishOwned(ID3D11Buffer* a_buffer, const void* a_data, UINT a_size);
 }
