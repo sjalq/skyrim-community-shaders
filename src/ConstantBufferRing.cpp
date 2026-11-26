@@ -56,8 +56,11 @@ namespace ConstantBufferRing
 		struct Record
 		{
 			ID3D11Buffer* buffer = nullptr;         // one reference is held so the address cannot be reused
-			std::unique_ptr<ShadowBlock[]> shadow;  // latest contents; the engine writes here between Map and Unmap
-			std::unique_ptr<ShadowBlock[]> lastUpload;  // byteWidth bytes of the latest upload, to skip unchanged ones
+			std::unique_ptr<ShadowBlock[]> shadow;  // the engine writes here between Map and Unmap
+			// Latest contents (byteWidth bytes): every ring upload and the restore at deactivation copy from
+			// here, and an Unmap whose shadow equals it skips the upload. A changed Unmap swaps it with the
+			// shadow, so the next map writes into the storage of the upload before (see TryMap).
+			std::unique_ptr<ShadowBlock[]> lastUpload;
 			UINT byteWidth = 0;
 			UINT allocBytes = 0;                             // byteWidth rounded up to kAlignmentBytes
 			UINT numConstants = 0;                           // allocBytes / 16, so a multiple of 16 and at most 4096
@@ -65,6 +68,12 @@ namespace ConstantBufferRing
 			uint32_t generation = 0;                         // ring generation of that upload; 0 = never uploaded
 			std::array<uint16_t, kStageCount> boundSlots{};  // slots that logically hold this buffer
 			bool mapped = false;
+			bool shadowCurrent = true;  // the shadow equals lastUpload (only consulted when a map starts)
+			// Every slot in boundSlots has the record's latest upload bound (boundFirst/boundCount equal
+			// RingWindow), so RebindRecord would bind nothing. Set by RebindRecord; cleared by CopyToRing
+			// (new range) and ForgetBindings, false for a new record. ApplyBinds binds every slot it tracks
+			// for a record right away, so binds keep it valid; Wrap rebinds every slot it invalidates.
+			bool bindingsCurrent = false;
 		};
 
 		/** @brief What the application has bound to one stage slot. */
@@ -106,6 +115,9 @@ namespace ConstantBufferRing
 
 			std::vector<std::unique_ptr<Record>> records;
 			ankerl::unordered_dense::map<const void*, Record*> managed;
+			// Latest Find() result (null record for an unmanaged buffer); reset whenever `managed` changes.
+			const void* findKey = nullptr;
+			Record* findRecord = nullptr;
 			std::vector<std::unique_ptr<Record>> draining;  // still mapped by the engine when the ring went off
 			uint32_t mappedCount = 0;
 			std::array<std::array<Slot, kSlotCount>, kStageCount> slots{};
@@ -113,8 +125,10 @@ namespace ConstantBufferRing
 			uint32_t uploadsThisFrame = 0;
 			uint32_t uploadsLastFrame = 0;
 			uint32_t dedupedThisFrame = 0;
+			uint32_t rebindsSkippedThisFrame = 0;
 			uint64_t uploadsSinceActivation = 0;
 			uint64_t dedupedSinceActivation = 0;
+			uint64_t rebindsSkippedSinceActivation = 0;
 			uint64_t wrapsSinceActivation = 0;
 			uint32_t framesSinceActivation = 0;
 			bool loggedStats = false;
@@ -157,8 +171,19 @@ namespace ConstantBufferRing
 		{
 			if (!a_resource)
 				return nullptr;
+			// The engine maps, unmaps and binds the same buffer back to back, so the latest lookup is kept.
+			if (a_resource == g.findKey)
+				return g.findRecord;
 			const auto it = g.managed.find(a_resource);
-			return it != g.managed.end() ? it->second : nullptr;
+			g.findKey = a_resource;
+			g.findRecord = it != g.managed.end() ? it->second : nullptr;
+			return g.findRecord;
+		}
+
+		void ForgetFindCache()
+		{
+			g.findKey = nullptr;
+			g.findRecord = nullptr;
 		}
 
 		[[nodiscard]] uint16_t SlotBit(UINT a_index)
@@ -194,15 +219,16 @@ namespace ConstantBufferRing
 			slot.boundCount = window.count;
 		}
 
-		void RebindRecord(const Record& a_record)
+		void RebindRecord(Record& a_record)
 		{
 			for (uint32_t stage = 0; stage < kStageCount; ++stage) {
 				for (uint32_t bits = a_record.boundSlots[stage]; bits != 0; bits &= bits - 1)
 					BindRingSlot(static_cast<Stage>(stage), static_cast<UINT>(std::countr_zero(bits)));
 			}
+			a_record.bindingsCurrent = true;
 		}
 
-		/** @brief Copies the shadow into the ring at the cursor. Space must already be available. */
+		/** @brief Copies the record's latest contents into the ring at the cursor. Space must already be available. */
 		void CopyToRing(Record& a_record)
 		{
 			if (g.cursor + a_record.allocBytes > kRingBytes) {
@@ -210,7 +236,7 @@ namespace ConstantBufferRing
 				return;
 			}
 			if (g.ringData) {
-				std::memcpy(g.ringData + g.cursor, a_record.shadow.get(), a_record.byteWidth);
+				std::memcpy(g.ringData + g.cursor, a_record.lastUpload.get(), a_record.byteWidth);
 			} else {
 				D3D11_MAPPED_SUBRESOURCE mapped{};
 				if (FAILED(g.map(g.context, g.ring.get(), 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped))) {
@@ -218,16 +244,16 @@ namespace ConstantBufferRing
 					return;
 				}
 				if (mapped.pData)
-					std::memcpy(static_cast<std::byte*>(mapped.pData) + g.cursor, a_record.shadow.get(), a_record.byteWidth);
+					std::memcpy(static_cast<std::byte*>(mapped.pData) + g.cursor, a_record.lastUpload.get(), a_record.byteWidth);
 				g.unmap(g.context, g.ring.get(), 0);
 				if (!mapped.pData) {
 					g.uploadFailed = true;
 					return;
 				}
 			}
-			std::memcpy(a_record.lastUpload.get(), a_record.shadow.get(), a_record.byteWidth);
 			a_record.firstConstant = g.cursor / kConstantBytes;
 			a_record.generation = g.generation;
+			a_record.bindingsCurrent = false;  // its slots still show the previous range
 			g.cursor += a_record.allocBytes;
 			++g.uploadsThisFrame;
 		}
@@ -252,7 +278,7 @@ namespace ConstantBufferRing
 			++g.wrapsSinceActivation;
 
 			// The discard gave the ring new storage, so every window bound from the previous storage now
-			// reads undefined data. Bound buffers are uploaded again from their shadows and rebound.
+			// reads undefined data. Bound buffers are uploaded again from their latest contents and rebound.
 			for (uint32_t stage = 0; stage < kStageCount; ++stage) {
 				for (UINT index = 0; index < kSlotCount; ++index) {
 					Slot& slot = g.slots[stage][index];
@@ -266,22 +292,25 @@ namespace ConstantBufferRing
 			}
 		}
 
-		/** @brief Makes the record's shadow visible to the GPU in a fresh ring range. */
+		/** @brief Makes the record's latest contents visible to the GPU in a fresh ring range. */
 		void Upload(Record& a_record)
 		{
 			if (g.cursor + a_record.allocBytes > kRingBytes) {
 				Wrap();
 				if (g.uploadFailed)
 					return;
-				// The wrap re-uploads every bound buffer from its current shadow, possibly this one.
+				// The wrap re-uploads every bound buffer from its latest contents, possibly this one.
 				if (a_record.generation == g.generation)
 					return;
 			}
 			CopyToRing(a_record);
 		}
 
-		/** @brief Gives the engine buffer itself the latest contents (used when the ring turns off). */
-		void FlushToEngineBuffer(const Record& a_record)
+		/**
+		 * @brief Gives the engine buffer itself the latest contents (used when the ring turns off).
+		 * @param a_contents lastUpload for a buffer that is not mapped, the shadow at the Unmap of a draining one.
+		 */
+		void FlushToEngineBuffer(const Record& a_record, const ShadowBlock* a_contents)
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped{};
 			if (FAILED(g.map(g.context, a_record.buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -289,7 +318,7 @@ namespace ConstantBufferRing
 				return;
 			}
 			if (mapped.pData)
-				std::memcpy(mapped.pData, a_record.shadow.get(), a_record.byteWidth);
+				std::memcpy(mapped.pData, a_contents, a_record.byteWidth);
 			g.unmap(g.context, a_record.buffer, 0);
 		}
 
@@ -317,8 +346,10 @@ namespace ConstantBufferRing
 		{
 			for (auto& stageSlots : g.slots)
 				stageSlots.fill(Slot{});
-			for (auto& record : g.records)
+			for (auto& record : g.records) {
 				record->boundSlots.fill(0);
+				record->bindingsCurrent = false;
+			}
 		}
 
 		/** @brief Takes over an engine buffer the game executable is mapping with WRITE_DISCARD. */
@@ -365,6 +396,7 @@ namespace ConstantBufferRing
 
 			Record* raw = record.get();
 			g.managed.emplace(static_cast<const void*>(buffer), raw);
+			ForgetFindCache();  // it may hold this buffer as unmanaged
 			g.records.push_back(std::move(record));
 			return raw;
 		}
@@ -389,6 +421,7 @@ namespace ConstantBufferRing
 			g.uploadFailed = false;
 			g.uploadsSinceActivation = 0;
 			g.dedupedSinceActivation = 0;
+			g.rebindsSkippedSinceActivation = 0;
 			g.wrapsSinceActivation = 0;
 			g.framesSinceActivation = 0;
 			g.active.store(true, std::memory_order_relaxed);
@@ -421,11 +454,12 @@ namespace ConstantBufferRing
 					g.draining.push_back(std::move(record));  // finished by its Unmap
 					continue;
 				}
-				FlushToEngineBuffer(*record);
+				FlushToEngineBuffer(*record, record->lastUpload.get());
 				record->buffer->Release();
 			}
 			g.records.clear();
 			g.managed.clear();
+			ForgetFindCache();
 			g.mappedCount = 0;
 			g.ringData = nullptr;
 			g.active.store(false, std::memory_order_relaxed);
@@ -492,6 +526,8 @@ namespace ConstantBufferRing
 				const UINT first = hasWindows ? a_first[i] : 0;
 				const UINT count = hasWindows ? a_num[i] : kInvalid;
 				if (Record* record = records[i]) {
+					// The slot is bound to the record's latest upload right away and no other slot of the
+					// record changes, so record->bindingsCurrent stays valid.
 					Track(a_stage, index, a_buffers[i], record, first, count);
 					BindRingSlot(a_stage, index);
 				} else {
@@ -756,6 +792,7 @@ namespace ConstantBufferRing
 		g.uploadsLastFrame = std::exchange(g.uploadsThisFrame, 0);
 		g.uploadsSinceActivation += g.uploadsLastFrame;
 		g.dedupedSinceActivation += std::exchange(g.dedupedThisFrame, 0);
+		g.rebindsSkippedSinceActivation += std::exchange(g.rebindsSkippedThisFrame, 0);
 
 		if (g.uploadFailed && g.active.load(std::memory_order_relaxed))
 			DisableForSession("a ring map failed");
@@ -769,9 +806,10 @@ namespace ConstantBufferRing
 
 		if (g.active.load(std::memory_order_relaxed) && !g.loggedStats && ++g.framesSinceActivation == kStatsLogFrame) {
 			g.loggedStats = true;
-			logger::info("[CB Ring] After {} frames: {} engine constant buffers on the ring, {:.0f} uploads per frame, {:.0f} unchanged uploads skipped per frame, {} ring wraps",
+			logger::info("[CB Ring] After {} frames: {} engine constant buffers on the ring, {:.0f} uploads per frame, {:.0f} unchanged uploads skipped per frame, {:.0f} rebinds skipped per frame, {} ring wraps",
 				kStatsLogFrame, g.records.size(), static_cast<double>(g.uploadsSinceActivation) / kStatsLogFrame,
-				static_cast<double>(g.dedupedSinceActivation) / kStatsLogFrame, g.wrapsSinceActivation);
+				static_cast<double>(g.dedupedSinceActivation) / kStatsLogFrame,
+				static_cast<double>(g.rebindsSkippedSinceActivation) / kStatsLogFrame, g.wrapsSinceActivation);
 		}
 	}
 
@@ -793,11 +831,16 @@ namespace ConstantBufferRing
 				return false;
 		}
 
-		// The shadow always holds the latest contents, which satisfies both DISCARD (contents undefined)
-		// and NO_OVERWRITE (contents preserved); Unmap publishes it to a fresh ring range either way.
+		// After a changed Unmap the shadow holds the upload before the latest one. DISCARD leaves the
+		// contents undefined, so that is fine; NO_OVERWRITE preserves them, so the latest contents are
+		// copied back first. Unmap publishes the shadow to a fresh ring range either way.
 		if (!record->mapped) {
 			record->mapped = true;
 			++g.mappedCount;
+			if (a_mapType == D3D11_MAP_WRITE_NO_OVERWRITE && !record->shadowCurrent) {
+				std::memcpy(record->shadow.get(), record->lastUpload.get(), record->byteWidth);
+				record->shadowCurrent = true;
+			}
 		}
 		a_mapped->pData = record->shadow.get();
 		a_mapped->RowPitch = record->byteWidth;
@@ -819,10 +862,20 @@ namespace ConstantBufferRing
 			if (record->generation != 0 && record->generation == g.generation &&
 				std::memcmp(record->shadow.get(), record->lastUpload.get(), record->byteWidth) == 0) {
 				++g.dedupedThisFrame;
+				record->shadowCurrent = true;
+				// Nothing changed since every slot of the record was last bound to that range.
+				if (record->bindingsCurrent) {
+					++g.rebindsSkippedThisFrame;
+					return true;
+				}
 			} else {
+				// The shadow becomes the latest contents without a copy; the next map writes into the
+				// storage of the previous upload (see TryMap).
+				std::swap(record->shadow, record->lastUpload);
+				record->shadowCurrent = false;
 				Upload(*record);
 				if (g.uploadFailed) {
-					// Deactivation writes the shadow into the engine buffer itself, so this update still lands.
+					// Deactivation writes the latest contents into the engine buffer itself, so this update still lands.
 					DisableForSession("a ring map failed");
 					return true;
 				}
@@ -835,7 +888,7 @@ namespace ConstantBufferRing
 		const auto draining = std::ranges::find_if(g.draining, [&](const auto& a_record) { return a_record->buffer == a_resource; });
 		if (draining == g.draining.end())
 			return false;
-		FlushToEngineBuffer(**draining);
+		FlushToEngineBuffer(**draining, (*draining)->shadow.get());  // the engine has just written the shadow
 		(*draining)->buffer->Release();
 		g.draining.erase(draining);
 		return true;
