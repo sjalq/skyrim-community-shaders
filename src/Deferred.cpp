@@ -696,12 +696,179 @@ void Deferred::Hooks::Main_RenderWorld_BlendedDecals::thunk(RE::BSShaderAccumula
 	// After this point, water starts rendering
 };
 
+namespace
+{
+	// Reflection cubemap amortisation. TESWaterReflections drives BSCubeMapCamera::RenderCubemap and passes
+	// the face in a2 (one face per update), so decisions are tracked per (camera, face): every face keeps
+	// updating, just on every Nth time it comes up. Skipped updates leave the previous face contents in place.
+	constexpr uint32_t kCubemapWarmupFrames = 30;  // render everything after a load, cell change or interval change
+	constexpr uint32_t kCubemapStatsFrames = 600;  // log skip statistics this long after an interval change
+	constexpr size_t kCubemapFaceSlots = 7;        // faces 0..5, plus one slot for any other face argument
+	constexpr uint32_t kCubemapMaxCadence = 16;    // cap on the learned frames-between-updates of one slot
+	constexpr uint32_t kCubemapFacesPerCycle = 6;
+
+	struct CubemapSlot
+	{
+		bool seen = false;
+		bool lastDecision = true;
+		uint32_t lastCallFrame = 0;
+		uint32_t lastRenderFrame = 0;
+		uint32_t cadence = 1;  // frames between the two previous updates of this slot
+		uint32_t skipsInRow = 0;
+		uint32_t rendersInCycle = 0;  // renders since the last drift skip (cadence-1 slots only)
+	};
+
+	struct CubemapCameraState
+	{
+		const RE::NiAVObject* camera = nullptr;
+		uint32_t lastUseFrame = 0;
+		std::array<CubemapSlot, kCubemapFaceSlots> slots{};
+	};
+
+	struct CubemapAmortizer
+	{
+		std::atomic<int> interval{ 1 };
+		int appliedInterval = 1;
+		uint32_t warmupUntilFrame = 0;
+		const RE::TESObjectCELL* lastCell = nullptr;
+		std::array<CubemapCameraState, 4> cameras{};
+		bool statsPending = false;
+		uint32_t statsUntilFrame = 0;
+		uint32_t statsUpdates = 0;
+		uint32_t statsSkipped = 0;
+		uint32_t statsFaceMask = 0;  // bit f = face argument f seen (0..30), bit 31 = anything else
+		uint32_t statsCameras = 0;
+	};
+
+	CubemapAmortizer& Cubemap()
+	{
+		static CubemapAmortizer amortizer;
+		return amortizer;
+	}
+
+	bool FrameBefore(uint32_t a_frame, uint32_t a_limit) { return static_cast<int32_t>(a_frame - a_limit) < 0; }
+
+	CubemapCameraState& CubemapCameraEntry(CubemapAmortizer& a, const RE::NiAVObject* a_camera, uint32_t a_frame)
+	{
+		CubemapCameraState* empty = nullptr;
+		CubemapCameraState* oldest = nullptr;
+		for (auto& entry : a.cameras) {
+			if (entry.camera == a_camera) {
+				entry.lastUseFrame = a_frame;
+				return entry;
+			}
+			if (!entry.camera) {
+				if (!empty)
+					empty = &entry;
+			} else if (!oldest || FrameBefore(entry.lastUseFrame, oldest->lastUseFrame)) {
+				oldest = &entry;
+			}
+		}
+		auto& entry = empty ? *empty : *oldest;
+		entry = CubemapCameraState{};
+		entry.camera = a_camera;
+		entry.lastUseFrame = a_frame;
+		a.statsCameras++;
+		return entry;
+	}
+
+	// Returns false when this cubemap update may be skipped (its face keeps last update's contents).
+	bool ShouldRenderReflectionCubemap(const RE::NiAVObject* a_camera, int a_face)
+	{
+		auto& a = Cubemap();
+		const uint32_t frame = globals::state->frameCount;
+		const int interval = a.interval.load(std::memory_order_relaxed);
+
+		if (interval != a.appliedInterval) {
+			logger::info("[ReflectionCubemap] Update interval {} -> {} (1 renders every update)", a.appliedInterval, interval);
+			a.appliedInterval = interval;
+			a.warmupUntilFrame = frame + kCubemapWarmupFrames;
+			a.statsPending = interval > 1;
+			a.statsUntilFrame = frame + kCubemapStatsFrames;
+			a.statsUpdates = a.statsSkipped = a.statsFaceMask = a.statsCameras = 0;
+			a.cameras = {};
+		}
+
+		if (interval <= 1)
+			return true;
+
+		const auto* player = RE::PlayerCharacter::GetSingleton();
+		const RE::TESObjectCELL* cell = player ? player->GetParentCell() : nullptr;
+		if (cell != a.lastCell || globals::state->IsMainOrLoadingMenuOpen()) {
+			a.lastCell = cell;
+			a.warmupUntilFrame = frame + kCubemapWarmupFrames;
+		}
+		const bool warmup = FrameBefore(frame, a.warmupUntilFrame);
+
+		auto& camera = CubemapCameraEntry(a, a_camera, frame);
+		const bool knownFace = a_face >= 0 && a_face < static_cast<int>(kCubemapFacesPerCycle);
+		auto& s = camera.slots[knownFace ? static_cast<size_t>(a_face) : kCubemapFaceSlots - 1];
+
+		bool render;
+		if (s.seen && s.lastCallFrame == frame) {
+			// Same slot again within one frame: keep this frame's decision so a multi-face frame renders or skips as a whole.
+			render = s.lastDecision;
+		} else {
+			const uint32_t n = static_cast<uint32_t>(interval);
+			// A slot updated every frame might have its face chosen outside this call; one extra skip per
+			// cycle of renders shifts the phase so a period-6 face rotation still reaches every face.
+			const uint32_t drift = (s.cadence == 1 && s.rendersInCycle >= kCubemapFacesPerCycle) ? 1u : 0u;
+			const bool due = s.skipsInRow + 1 >= n + drift;
+			// Safety: never let a slot go longer than (N + 1) of its normal update gaps without rendering.
+			const bool stale = s.seen && (frame - s.lastRenderFrame) > (n + 1) * s.cadence;
+			render = !s.seen || warmup || due || stale;
+
+			if (s.seen)
+				s.cadence = std::clamp(frame - s.lastCallFrame, 1u, kCubemapMaxCadence);
+			s.seen = true;
+			s.lastCallFrame = frame;
+			s.lastDecision = render;
+			if (render) {
+				s.lastRenderFrame = frame;
+				s.skipsInRow = 0;
+				s.rendersInCycle = drift ? 0 : s.rendersInCycle + 1;
+			} else {
+				s.skipsInRow++;
+			}
+		}
+
+		if (a.statsPending) {
+			a.statsUpdates++;
+			a.statsSkipped += render ? 0 : 1;
+			a.statsFaceMask |= (a_face >= 0 && a_face < 31) ? (1u << a_face) : (1u << 31);
+			if (!FrameBefore(frame, a.statsUntilFrame)) {
+				logger::info("[ReflectionCubemap] Interval {}: skipped {} of {} cubemap updates over {} frames (face arguments seen 0x{:08X}, {} camera(s))",
+					interval, a.statsSkipped, a.statsUpdates, kCubemapStatsFrames, a.statsFaceMask, a.statsCameras);
+				a.statsPending = false;
+			}
+		}
+
+		return render;
+	}
+}
+
+int ReflectionCubemap::GetInterval()
+{
+	return Cubemap().interval.load(std::memory_order_relaxed);
+}
+
+void ReflectionCubemap::SetInterval(int a_interval)
+{
+	Cubemap().interval.store(std::clamp(a_interval, kMinInterval, kMaxInterval), std::memory_order_relaxed);
+}
+
 void Deferred::Hooks::BSCubeMapCamera_RenderCubemap::thunk(RE::NiAVObject* camera, int a2, bool a3, bool a4, bool a5)
 {
 	auto deferred = globals::deferred;
 	auto state = globals::state;
 
+	// Runs on every update, rendered or skipped: it sets state->activeReflections (read by Dynamic Cubemaps
+	// each frame) and binds per-frame resources (Cloud Shadows t25 copy, IBL t76-79, Terrain Shadows t60).
 	deferred->ReflectionsPrepasses();
+
+	if (!ShouldRenderReflectionCubemap(camera, a2))
+		return;
+
 	state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections);
 	func(camera, a2, a3, a4, a5);
 	state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections);

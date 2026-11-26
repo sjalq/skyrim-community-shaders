@@ -13,6 +13,21 @@
 #define MASKS RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS
 #define MASKS2 RE::RENDER_TARGETS::kRAWINDIRECT_PREVIOUS_DOWNSCALED
 
+/**
+ * @brief Reflection cubemap update interval (Advanced > Developer > "Reflection Cubemap Interval").
+ *
+ * 1 renders every BSCubeMapCamera::RenderCubemap update (vanilla). N > 1 renders each cubemap face on
+ * every Nth update and keeps the previous contents otherwise. Read on every update, so changes apply live.
+ */
+namespace ReflectionCubemap
+{
+	inline constexpr int kMinInterval = 1;
+	inline constexpr int kMaxInterval = 8;
+
+	int GetInterval();
+	void SetInterval(int a_interval);
+}
+
 class Deferred
 {
 public:

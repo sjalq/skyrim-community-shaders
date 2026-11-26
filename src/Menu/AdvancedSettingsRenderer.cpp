@@ -8,6 +8,7 @@
 
 #include "CSEditor/EditorWindow.h"
 #include "ConstantBufferRing.h"
+#include "Deferred.h"
 #include "FeatureIssues.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Fonts.h"
@@ -730,6 +731,19 @@ void AdvancedSettingsRenderer::RenderDeveloperSection()
 			ringStatus.managedBuffers, ringStatus.uploadsLastFrame);
 	else
 		ImGui::TextDisabled("%s", T("menu.advanced.constant_buffer_ring_inactive", "(inactive)"));
+
+	// Reflection cubemap update interval (GPU + CPU saving); read on every cubemap update, so it A/B tests live.
+	int reflectionCubemapInterval = ReflectionCubemap::GetInterval();
+	if (ImGui::SliderInt(T("menu.advanced.reflection_cubemap_interval", "Reflection Cubemap Interval"), &reflectionCubemapInterval,
+			ReflectionCubemap::kMinInterval, ReflectionCubemap::kMaxInterval))
+		ReflectionCubemap::SetInterval(reflectionCubemapInterval);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("%s", T("menu.advanced.reflection_cubemap_interval_tooltip",
+							  "Renders each face of the game's reflection cubemap (water and sky reflections, IBL) on every Nth update "
+							  "and keeps the previous contents otherwise.\n"
+							  "1 updates every time (vanilla). Higher values save GPU and main-thread CPU time; reflections update more slowly.\n"
+							  "Every update still renders for 30 frames after a load, cell change or change of this value. Applies immediately."));
+	}
 
 	ImGui::Spacing();
 	ImGui::Separator();

@@ -536,6 +536,7 @@ void State::SaveToJson(nlohmann::json& settings)
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Partial Precision"] = enablePartialPrecision.load(std::memory_order_relaxed);
 	advanced["Constant Buffer Ring"] = ConstantBufferRing::IsEnabled();
+	advanced["Reflection Cubemap Interval"] = ReflectionCubemap::GetInterval();
 	settings["Advanced"] = advanced;
 
 	json general;
@@ -617,6 +618,8 @@ void State::LoadFromJson(nlohmann::json& settings)
 			enablePartialPrecision.store(advanced["Partial Precision"].get<bool>(), std::memory_order_relaxed);
 		if (advanced.contains("Constant Buffer Ring") && advanced["Constant Buffer Ring"].is_boolean())
 			ConstantBufferRing::SetEnabled(advanced["Constant Buffer Ring"].get<bool>());
+		if (advanced.contains("Reflection Cubemap Interval") && advanced["Reflection Cubemap Interval"].is_number_integer())
+			ReflectionCubemap::SetInterval(advanced["Reflection Cubemap Interval"].get<int>());
 	}
 
 	if (settings.contains("General") && settings["General"].is_object()) {
